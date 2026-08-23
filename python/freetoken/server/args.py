@@ -515,6 +515,16 @@ def parse_args(
     )
 
     parser.add_argument(
+        "--moe-collect-stats",
+        action="store_true",
+        default=ServerArgs.moe_collect_stats,
+        help=(
+            "Collect decode expert-cache counters on-device and expose throttled "
+            "snapshots through /v1/stats and `ft ctl stats`."
+        ),
+    )
+
+    parser.add_argument(
         "--moe-cpu-threads",
         type=int,
         default=ServerArgs.moe_cpu_threads,

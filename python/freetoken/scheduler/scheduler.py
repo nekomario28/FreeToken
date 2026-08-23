@@ -402,7 +402,7 @@ class Scheduler(SchedulerIOMixin):
                 m.swa_used_tokens = swa_used
                 m.swa_total_tokens = swa_total
                 m.gpu_mem_bytes = mem
-        self.status_reporter.report_batch(
+        decode_status_emitted = self.status_reporter.report_batch(
             batch,
             running_reqs=len(self.decode_manager.running_reqs),
             queue_reqs=len(self.prefill_manager.pending_list),
@@ -412,6 +412,21 @@ class Scheduler(SchedulerIOMixin):
             mamba_slots=mamba_slots,
             swa_tokens=swa_tokens,
         )
+        moe_cache = self.engine.moe_offload_cache
+        if (
+            reply
+            and decode_status_emitted
+            and moe_cache is not None
+            and moe_cache.collect_stats
+        ):
+            # One host read per decode status interval, never per layer/token. The
+            # counters are accumulated on-device inside the captured decode graph.
+            moe_stats = moe_cache.decode_miss_stats()
+            for m in reply:
+                m.moe_layer_calls = moe_stats["layer_calls"]
+                m.moe_active_experts = moe_stats["active_experts"]
+                m.moe_missing_experts = moe_stats["missing_experts"]
+                m.moe_fetched_experts = moe_stats["fetched_experts"]
         self.send_result(reply)
 
     def _match_stop_str(self, req: Req) -> str | None:
