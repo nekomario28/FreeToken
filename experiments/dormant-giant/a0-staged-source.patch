@@ -1,0 +1,139 @@
+diff --git a/python/freetoken/moe/offload_cache.py b/python/freetoken/moe/offload_cache.py
+--- a/python/freetoken/moe/offload_cache.py
++++ b/python/freetoken/moe/offload_cache.py
+@@ -279,6 +279,9 @@ class OffloadMoeCache:
+         GPU movement paths cannot serve them and they are rejected here
+         (platform-specific residency policies are not implemented).
+         """
++        assert not getattr(self, "_staged_source_mode", False), (
++            "persistent host banks cannot be attached after staged A0 initialization"
++        )
+         from freetoken.moe.host_banks import HostResidency
+ 
+         assert set(sources) == set(self.bank_schema), (
+@@ -521,5 +524,54 @@ class OffloadMoeCache:
+             return tuple(cache for _, cache in self.banks)
+         return tuple(cache[:n] for _, cache in self.banks)
+ 
++    def init_staged_bank_caches(
++        self,
++        layouts: dict[str, tuple[tuple[int, ...], torch.dtype]],
++    ) -> None:
++        """Allocate BF16 GPU slot caches without persistent full host expert banks.
++
++        Dormant Giant A0 owns the cold source and supplies compact pinned rows only
++        after FreeToken has authored the pending copy slots. This P0 seam is
++        deliberately narrow: GPU offload only, no prefill overlap, no CUDA-graph
++        capture, and BF16 only.
++        """
++        assert self.decode_target == "gpu", "staged A0 is GPU offload only"
++        assert self.quant_format == "bf16", "staged A0 is BF16 only"
++        assert not self.prefill_overlap, "staged A0 does not implement prefill overlap"
++        assert not self.bank_sources and not self.banks, "host banks are already registered"
++        assert set(layouts) == set(self.bank_schema), (
++            f"layouts {sorted(layouts)} do not match schema {self.bank_schema}"
++        )
++
++        self.bank_caches = {}
++        for name in self.bank_schema:
++            row_shape, dtype = layouts[name]
++            row_shape = tuple(int(dim) for dim in row_shape)
++            assert row_shape and all(dim > 0 for dim in row_shape), (name, row_shape)
++            self.bank_caches[name] = torch.empty(
++                (self.cache_size, *row_shape), dtype=dtype, device=self.device
++            )
++
++        self.banks = [([], self.bank_caches[name]) for name in self.bank_schema]
++        self.layer_residency = []
++        self._copy_fused_ok = False
++        self._copy_dst_ptrs = None
++        self._copy_src_ptrs = None
++        self._copy_feat_bytes = None
++        self._staged_source_mode = True
++
++    def set_staged_copy_callback(self, callback) -> None:
++        """Install the synchronous graph-disabled A0 source hook used by copy_missing."""
++        assert self.decode_target == "gpu", "staged A0 is GPU offload only"
++        assert self.quant_format == "bf16", "staged A0 is BF16 only"
++        assert not self.prefill_overlap, "staged A0 does not implement prefill overlap"
++        assert getattr(self, "_staged_source_mode", False), (
++            "init_staged_bank_caches must run before installing staged A0 callback"
++        )
++        assert not self.bank_sources, "staged A0 forbids persistent full host banks"
++        if not callable(callback):
++            raise TypeError("staged copy callback must be callable")
++        self._staged_copy_callback = callback
++
+     def _init_prefill_overlap_buffers(self) -> None:
+         assert self.banks, "set_bank_sources must register the banks first"
+@@ -923,9 +975,70 @@ class OffloadMoeCache:
+             "norm_entropy": norm_ent,
+         }
+ 
++    def copy_missing_bank_from_compact(
++        self,
++        bank_name: str,
++        compact_source: torch.Tensor,
++        *,
++        start: int,
++        count: int,
++    ) -> None:
++        """Synchronously copy one staged-source bank microbatch into owned slots.
++
++        ``start``/``count`` select the exact ``evict_slots`` slice authored by the
++        immediately preceding ``ensure_experts`` or ``materialize_layer``. Compact
++        source rows are local 0..count-1. ``num_indices=None`` makes the existing
++        kernel use the sliced index length instead of the total pending-copy count.
++        """
++        assert self.decode_target == "gpu", "staged A0 is GPU offload only"
++        assert self.quant_format == "bf16", "staged A0 is BF16 only"
++        assert self.device.type == "cuda", "staged A0 requires CUDA"
++        assert not self.prefill_overlap, "staged A0 does not implement prefill overlap"
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError("staged A0 is graph-disabled; CUDA capture is unsupported")
++        assert isinstance(start, int) and not isinstance(start, bool) and start >= 0
++        assert isinstance(count, int) and not isinstance(count, bool) and count >= 0
++        authoritative_count = int(self.num_indices.item())
++        assert start + count <= authoritative_count, (
++            start,
++            count,
++            authoritative_count,
++        )
++        if bank_name not in self.bank_caches:
++            raise KeyError(f"unknown staged bank {bank_name!r}")
++        if count == 0:
++            return
++
++        cache = self.bank_caches[bank_name]
++        src = compact_source
++        assert src.device.type == "cpu" and src.is_pinned(), (
++            f"compact bank {bank_name!r} must be pinned CPU memory"
++        )
++        assert src.is_contiguous(), f"compact bank {bank_name!r} must be contiguous"
++        assert src.size(0) == count, (bank_name, src.shape, count)
++        assert src.shape[1:] == cache.shape[1:], (bank_name, src.shape, cache.shape)
++        assert src.dtype == cache.dtype, (bank_name, src.dtype, cache.dtype)
++
++        dst_indices = self.evict_slots[start : start + count]
++        compact_src_indices = torch.arange(
++            count, dtype=dst_indices.dtype, device=self.device
++        )
++        from freetoken.kernel import fast_index_copy_jit
++
++        fast_index_copy_jit(cache, dst_indices, src, compact_src_indices, None)
++        # P0 releases the compact source/lease immediately after this call. Keep
++        # the first physical seam synchronous so GPU host-memory reads are complete.
++        torch.cuda.current_stream(self.device).synchronize()
++
+     def copy_missing(self) -> None:
+         assert self.banks, "set_bank_sources must register the banks first"
+         layer_id = self._pending_src_layer
+         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
++        staged_copy = getattr(self, "_staged_copy_callback", None)
++        if staged_copy is not None:
++            if torch.cuda.is_current_stream_capturing():
++                raise RuntimeError("staged A0 is graph-disabled; CUDA capture is unsupported")
++            staged_copy(self, layer_id)
++            return
+         if self._copy_fused_ok:
+             from freetoken.kernel.fast_index_copy import fast_index_copy_multi_jit
