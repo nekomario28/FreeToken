@@ -45,6 +45,11 @@ class UserReply(BaseFrontendMsg):
     swa_total_tokens: int = 0
     # Bytes the engine process holds on the GPU (torch reserved pool). 0 when not reported.
     gpu_mem_bytes: int = 0
+    # Last throttled cumulative decode-only MoE snapshot. layer_calls == 0 means absent.
+    moe_layer_calls: int = 0
+    moe_active_experts: int = 0
+    moe_missing_experts: int = 0
+    moe_fetched_experts: int = 0
     # Set (with finished=True) when a request failed before producing output — e.g. a chat
     # template that the tokenizer cannot render, or a prompt that exceeds the KV budget the
     # scheduler can serve. Carries a human-readable reason. Without this, such a request would

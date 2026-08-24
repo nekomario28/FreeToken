@@ -466,6 +466,7 @@ class OffloadMoeCache:
         self.num_indices.zero_()
         self.num_missing_full.zero_()
         self.expert_recency.fill_(-1)
+        self.lru_stats.zero_()
         self.stat_missing.zero_()
         self.stat_active.zero_()
         self.stat_calls.zero_()
@@ -884,14 +885,21 @@ class OffloadMoeCache:
 
     def decode_miss_stats(self) -> dict:
         if self.decode_target == "hybrid":
-            active = int(self.stat_active.item())
-            missing = int(self.stat_missing.item())
-            calls = int(self.stat_calls.item())
+            # One bounded device-to-host synchronization for the whole snapshot.
+            active, missing, calls, fetched = torch.stack(
+                (self.stat_active, self.stat_missing, self.stat_calls, self.stat_fetched)
+            ).tolist()
         else:
-            active, missing, calls = (int(x) for x in self.lru_stats.sum(0))
-        fetched = int(self.stat_fetched.item())
+            active, missing, calls = self.lru_stats.sum(0).tolist()
+            # The regular LRU path schedules every distinct miss for H2D copy. This
+            # also covers mixed --moe-cpu-layers runs: CPU layers skip ensure_experts,
+            # while every call represented in lru_stats is a GPU-offload layer.
+            fetched = missing
         return {
             "layer_calls": calls,
+            "active_experts": active,
+            "missing_experts": missing,
+            "fetched_experts": fetched,
             "active_per_layer": (active / calls) if calls else 0.0,
             "missing_per_layer": (missing / calls) if calls else 0.0,
             "miss_rate": (missing / active) if active else 0.0,
