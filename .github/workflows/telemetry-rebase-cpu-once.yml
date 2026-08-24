@@ -25,6 +25,7 @@ jobs:
           python -m pip install \
             pytest \
             'apache-tvm-ffi==0.1.13.post3' \
+            'partial-json-parser==0.2.1.1.post7' \
             'numpy>=2.0,<2.5' \
             'pyzmq>=27,<28' \
             'huggingface_hub>=1.5,<2' \
