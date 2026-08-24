@@ -40,7 +40,7 @@ jobs:
             'triton==3.6.0' \
             'flashlib==0.3.0'
 
-      - name: Run directly affected CPU tests
+      - name: Run scheduler and telemetry CPU regression
         shell: bash
         env:
           PYTHONPATH: python
@@ -48,7 +48,6 @@ jobs:
         run: |
           set -euo pipefail
           python -m pytest -q \
+            tests/scheduler \
             tests/server/test_message_wire.py \
-            tests/server/test_moe_stats.py \
-            tests/scheduler/test_scheduler_status.py \
-            tests/scheduler/test_abort_inflight_prefill.py
+            tests/server/test_moe_stats.py
