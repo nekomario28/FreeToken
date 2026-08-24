@@ -8,6 +8,8 @@ import unittest
 import uuid
 
 
+# Keep this regression dependency-free: it executes the exact source methods via AST so the
+# rebuild-epoch contract can be checked before the broader runtime dependency suite is installed.
 ROOT = Path(__file__).resolve().parents[2]
 API_SERVER = ROOT / "python/freetoken/server/api_server.py"
 STATS = ROOT / "python/freetoken/server/stats.py"
