@@ -34,7 +34,7 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
-    ) -> None:
+    ) -> bool:
         if batch.is_prefill:
             self._report_prefill(
                 batch,
@@ -45,8 +45,9 @@ class SchedulerStatusReporter:
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
             )
+            return False
         elif batch.is_decode:
-            self._report_decode(
+            return self._report_decode(
                 batch,
                 running_reqs=running_reqs,
                 queue_reqs=queue_reqs,
@@ -56,6 +57,7 @@ class SchedulerStatusReporter:
                 mamba_slots=mamba_slots,
                 swa_tokens=swa_tokens,
             )
+        return False
 
     def _report_prefill(
         self,
@@ -101,11 +103,11 @@ class SchedulerStatusReporter:
         page_size: int,
         mamba_slots: tuple[int, int] | None = None,
         swa_tokens: tuple[int, int] | None = None,
-    ) -> None:
+    ) -> bool:
         self._decode_forward_count += 1
         self._decode_generated_tokens += len(batch.reqs)
         if self._decode_forward_count % self.decode_log_interval != 0:
-            return
+            return False
 
         now = self.clock()
         gap = now - self._last_decode_time
@@ -122,6 +124,7 @@ class SchedulerStatusReporter:
             f"gen throughput (token/s): {gen_throughput:.2f}, "
             f"#queue-req: {queue_reqs}"
         )
+        return True
 
 
 def _usage_ratio(used: int, total: int) -> float:

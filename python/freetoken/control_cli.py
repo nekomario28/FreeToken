@@ -230,6 +230,21 @@ def _format_stats(doc: dict[str, Any]) -> str:
         lines.append(f"mamba={mamba.get('used_slots', 0)}/{mamba.get('total_slots', 0)} slots")
     else:
         lines.append("mamba=none")
+    moe = doc.get("moe")
+    if isinstance(moe, dict):
+        lines.append(
+            f"moe_cache hit_rate={100 * moe.get('cache_hit_rate', 0):.2f}% "
+            f"hits={moe.get('cache_hits', 0)} misses={moe.get('cache_misses', 0)} "
+            f"fetched={moe.get('fetched_experts', 0)} "
+            f"host_computed={moe.get('host_computed_experts', 0)}"
+        )
+        lines.append(
+            f"moe_h2d payload_bytes={moe.get('h2d_payload_bytes', 0)} "
+            f"bytes_per_expert={moe.get('bytes_per_expert', 0)} "
+            f"scope={moe.get('scope', 'unknown')}"
+        )
+    else:
+        lines.append("moe_cache=none")
     return "\n".join(lines)
 
 
