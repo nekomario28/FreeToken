@@ -1,0 +1,56 @@
+name: ROCm telemetry probe once
+
+on:
+  pull_request:
+    branches:
+      - feat/moe-transfer-stats-upstream-ready
+
+permissions:
+  contents: read
+
+jobs:
+  rocm-probe:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'experiment/telemetry-rocm-current'
+    runs-on: self-hosted
+    timeout-minutes: 5
+    steps:
+      - name: Identify runner and ROCm visibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner=${RUNNER_NAME:-unknown}"
+          echo "arch=$(uname -m)"
+          uname -a
+          df -h /
+          free -h || true
+          command -v rocminfo || true
+          command -v rocm-smi || true
+          command -v hipcc || true
+          test -e /dev/kfd
+          test -e /dev/dri/renderD128 || ls -l /dev/dri || true
+
+          if command -v rocminfo >/dev/null 2>&1; then
+            rocminfo | tee /tmp/rocminfo.txt
+            grep -Eq 'gfx110[0-3]' /tmp/rocminfo.txt
+          elif command -v rocm-smi >/dev/null 2>&1; then
+            rocm-smi --showproductname --showuniqueid --showmeminfo vram | tee /tmp/rocm-smi.txt
+          else
+            echo 'ROCM_TELEMETRY_PROBE=BLOCKED_NO_ROCM_TOOLING'
+            exit 1
+          fi
+
+          python - <<'PY'
+          try:
+              import torch
+          except Exception as exc:
+              print(f"torch_import=unavailable:{exc}")
+          else:
+              print(f"torch={torch.__version__}")
+              print(f"torch_hip={getattr(torch.version, 'hip', None)}")
+              print(f"cuda_available={torch.cuda.is_available()}")
+              if torch.cuda.is_available():
+                  print(f"device={torch.cuda.get_device_name(0)}")
+          PY
+          echo 'ROCM_TELEMETRY_PROBE=RUNNER_ROCM_VISIBLE'
