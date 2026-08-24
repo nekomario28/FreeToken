@@ -52,8 +52,9 @@ def _hip_cflags(extra: List[str]) -> List[str]:
     """HIP flags for a kernel build on ROCm."""
     # TODO(ROCm): Triton autotune configs need RDNA3-specific tuning (wave count, LDS size).
     flags = DEFAULT_HIP_CFLAGS + extra
-    rocm_arch = os.getenv("FREETOKEN_ROCM_ARCH", "gfx1100;gfx1101;gfx1102;gfx1103")
-    flags = flags + [f"--offload-arch={rocm_arch}"]
+    raw_arches = os.getenv("FREETOKEN_ROCM_ARCH", "gfx1100;gfx1101;gfx1102;gfx1103")
+    arches = [arch for arch in re.split(r"[;,\s]+", raw_arches.strip()) if arch]
+    flags = flags + [f"--offload-arch={arch}" for arch in arches]
     return flags
 CPP_TEMPLATE_TYPE: TypeAlias = Union[int, float, bool]
 
