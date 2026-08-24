@@ -1,0 +1,40 @@
+name: ROCm telemetry integration CPU once
+
+on:
+  pull_request:
+    branches:
+      - feat/moe-transfer-stats-upstream-ready
+
+permissions:
+  contents: read
+
+jobs:
+  cpu-regression:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.head_ref == 'experiment/telemetry-rocm-current'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Install bounded CPU test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install \
+            pytest numpy pyzmq huggingface_hub transformers safetensors tqdm einops msgpack \
+            'uvicorn>=0.30,<1' 'fastapi>=0.115,<1' 'openai>=2.0,<3' \
+            'partial-json-parser==0.2.1.1.post7' 'apache-tvm-ffi==0.1.13.post3'
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.11.0'
+          python -m pip install --no-deps 'triton==3.6.0' 'flashlib==0.3.0'
+      - name: Run scheduler and telemetry CPU regression
+        shell: bash
+        env:
+          PYTHONPATH: python
+        run: |
+          set -euo pipefail
+          python -m pytest -q \
+            tests/scheduler \
+            tests/server/test_message_wire.py \
+            tests/server/test_moe_stats.py
