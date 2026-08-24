@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - feat/moe-transfer-stats-current
+  pull_request:
+    branches:
+      - tmp/telemetry-merge-target-check
 
 permissions:
   contents: read
