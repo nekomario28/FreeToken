@@ -1,0 +1,127 @@
+name: Pin budget PR validation
+
+on:
+  pull_request:
+    branches:
+      - validation/pin-budget-base
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 1
+
+      - name: Compile candidate source and regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            python/freetoken/engine/engine.py \
+            tests/engine/test_pin_budget.py
+
+      - name: Exercise exact pin-budget function
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import ast
+          import ctypes
+          import os as real_os
+          from pathlib import Path
+          from types import SimpleNamespace
+
+          source_path = Path('python/freetoken/engine/engine.py')
+          tree = ast.parse(source_path.read_text(encoding='utf-8'), filename=str(source_path))
+          node = next(
+              n for n in tree.body
+              if isinstance(n, ast.FunctionDef) and n.name == '_pin_budget_bytes'
+          )
+          module = ast.Module(body=[node], type_ignores=[])
+          ast.fix_missing_locations(module)
+          namespace = {'os': None}
+          exec(compile(module, str(source_path), 'exec'), namespace)
+          fn = namespace['_pin_budget_bytes']
+          gib = 2**30
+          real_windll = getattr(ctypes, 'windll', None)
+
+          class Query:
+              argtypes = None
+              restype = None
+
+              def __init__(self, total, *, succeeds=True):
+                  self.total = total
+                  self.succeeds = succeeds
+                  self.length = None
+
+              def __call__(self, ptr):
+                  status = ptr._obj
+                  self.length = int(status.dwLength)
+                  if not self.succeeds or self.length != 64:
+                      return 0
+                  status.ullTotalPhys = self.total
+                  return 1
+
+          namespace['os'] = SimpleNamespace(
+              name='nt', environ={'FREETOKEN_PIN_BUDGET_GB': '3.5'}
+          )
+          assert fn() == int(3.5 * gib)
+
+          query = Query(64 * gib)
+          ctypes.windll = SimpleNamespace(
+              kernel32=SimpleNamespace(GlobalMemoryStatusEx=query)
+          )
+          namespace['os'] = SimpleNamespace(name='nt', environ={})
+          assert fn() == int(64 * gib * 0.4)
+          assert query.length == 64
+
+          query = Query(64 * gib, succeeds=False)
+          ctypes.windll = SimpleNamespace(
+              kernel32=SimpleNamespace(GlobalMemoryStatusEx=query)
+          )
+          namespace['os'] = SimpleNamespace(name='nt', environ={})
+          try:
+              fn()
+          except OSError as exc:
+              assert 'GlobalMemoryStatusEx failed' in str(exc)
+          else:
+              raise AssertionError('failed Windows query was treated as successful/uncapped')
+
+          values = {'SC_PHYS_PAGES': 16 * 1024 * 1024, 'SC_PAGE_SIZE': 4096}
+          namespace['os'] = SimpleNamespace(
+              name='posix',
+              environ={},
+              uname=lambda: SimpleNamespace(release='6.8.0-microsoft-standard-WSL2'),
+              sysconf=values.__getitem__,
+          )
+          assert fn() == int(values['SC_PHYS_PAGES'] * 4096 * 0.4)
+
+          namespace['os'] = SimpleNamespace(
+              name='posix',
+              environ={},
+              uname=lambda: SimpleNamespace(release='6.8.0-64-generic'),
+          )
+          assert fn() is None
+
+          if real_os.name == 'nt':
+              ctypes.windll = real_windll
+              real_os.environ.pop('FREETOKEN_PIN_BUDGET_GB', None)
+              namespace['os'] = real_os
+              native_budget = fn()
+              assert isinstance(native_budget, int) and native_budget > gib
+              print(f'NATIVE_WINDOWS_GLOBAL_MEMORY_STATUS_PASS budget={native_budget}')
+
+          print('PIN_BUDGET_CANDIDATE_SEMANTICS_PASS')
+          PY
