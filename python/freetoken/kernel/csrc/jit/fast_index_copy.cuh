@@ -171,7 +171,8 @@ inline bool host_ptr_identity() {
 }
 
 inline void* device_alias(void* ptr, DLDevice dev) {
-    if (dev.device_type == kDLCUDA || host_ptr_identity()) {
+    if (dev.device_type == kDLCUDA || dev.device_type == kDLROCM ||
+        host_ptr_identity()) {
         return ptr;
     }
     void* mapped = nullptr;
@@ -293,7 +294,7 @@ inline auto get_sync_flag_ptr(
     auto flag_dtype = host::SymbolicDType{};
     host::TensorMatcher({1})
         .with_dtype<int32_t>(flag_dtype)
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLCUDA, kDLROCM>(device)
         .verify(sync_flag);
     return static_cast<int32_t*>(sync_flag.data_ptr());
 }
@@ -368,17 +369,17 @@ struct FastIndexCopyKernel {
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLCUDAHost, kDLROCM, kDLROCMHost, kDLCPU>()
         .verify(src);
 
         TensorMatcher({-1, D})
         .with_dtype(data_dtype)
-        .with_device<kDLCUDA, kDLCUDAHost, kDLCPU>()
+        .with_device<kDLCUDA, kDLCUDAHost, kDLROCM, kDLROCMHost, kDLCPU>()
         .verify(dst);
 
         TensorMatcher({L})
         .with_dtype<int32_t, int64_t>(indices_dtype)
-        .with_device<kDLCUDA>(device)
+        .with_device<kDLCUDA, kDLROCM>(device)
         .verify(src_indices)
         .verify(dst_indices);
 
@@ -387,7 +388,7 @@ struct FastIndexCopyKernel {
             const auto num_indices_tensor = num_indices.value();
             TensorMatcher({1})
                 .with_dtype<int64_t>(num_indices_dtype)
-                .with_device<kDLCUDA>(device)
+                .with_device<kDLCUDA, kDLROCM>(device)
                 .verify(num_indices_tensor);
 
             num_indices_data_ptr = static_cast<const int64_t*>(num_indices_tensor.data_ptr());
@@ -553,14 +554,14 @@ struct MultiIndexCopyKernel {
         auto indices_dtype = SymbolicDType{};
         auto num_indices_dtype = SymbolicDType{};
 
-        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({B}).with_dtype<int64_t>(ptr_dtype).with_device<kDLCUDA, kDLROCM>(device)
             .verify(dst_ptrs).verify(src_ptrs).verify(feat_bytes);
-        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA>(device)
+        TensorMatcher({L}).with_dtype<int32_t, int64_t>(indices_dtype).with_device<kDLCUDA, kDLROCM>(device)
             .verify(dst_indices).verify(src_indices);
 
         const int64_t* valid_length = nullptr;
         if (num_indices.has_value()) {
-            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA>(device)
+            TensorMatcher({1}).with_dtype<int64_t>(num_indices_dtype).with_device<kDLCUDA, kDLROCM>(device)
                 .verify(num_indices.value());
             valid_length = static_cast<const int64_t*>(num_indices.value().data_ptr());
         }
