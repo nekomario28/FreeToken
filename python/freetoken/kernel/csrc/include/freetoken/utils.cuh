@@ -6,6 +6,16 @@
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/extra/c_env_api.h>
 
+// FreeToken's native kernel call-sites historically use the DLPack CUDA tokens
+// as the generic GPU/device matcher. PyTorch on ROCm correctly exports kDLROCM
+// and kDLROCMHost instead. Keep the existing call-sites source-compatible under
+// hipcc by translating those tokens only after dlpack.h has defined the enums.
+// CUDA/nvcc builds do not see these aliases.
+#ifdef __HIP__
+#define kDLCUDA kDLROCM
+#define kDLCUDAHost kDLROCMHost
+#endif
+
 #include <concepts>
 #include <cstddef>
 #include <source_location>
