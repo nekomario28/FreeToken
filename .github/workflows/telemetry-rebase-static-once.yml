@@ -1,0 +1,106 @@
+name: Telemetry rebase static once
+
+on:
+  push:
+    branches:
+      - feat/moe-transfer-stats-current
+
+permissions:
+  contents: read
+
+jobs:
+  static:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify exact current-upstream feature scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          base=bd372b630a028e3faa51f4ab0ef6a98c2f2de501
+          git cat-file -e "$base^{commit}"
+          git diff --check "$base" HEAD
+          python - <<'PY'
+          import subprocess
+
+          base = "bd372b630a028e3faa51f4ab0ef6a98c2f2de501"
+          expected = {
+              ".github/workflows/telemetry-rebase-static-once.yml",
+              "docs/cli.md",
+              "python/freetoken/control_cli.py",
+              "python/freetoken/message/frontend.py",
+              "python/freetoken/message/tokenizer.py",
+              "python/freetoken/moe/offload_cache.py",
+              "python/freetoken/scheduler/scheduler.py",
+              "python/freetoken/scheduler/status.py",
+              "python/freetoken/server/args.py",
+              "python/freetoken/server/stats.py",
+              "python/freetoken/tokenizer/server.py",
+              "tests/scheduler/test_abort_inflight_prefill.py",
+              "tests/scheduler/test_scheduler_status.py",
+              "tests/server/test_message_wire.py",
+              "tests/server/test_moe_stats.py",
+          }
+          actual = set(
+              subprocess.check_output(
+                  ["git", "diff", "--name-only", base, "HEAD"], text=True
+              ).splitlines()
+          )
+          assert actual == expected, (sorted(actual - expected), sorted(expected - actual))
+          print(f"PASS feature-scope files={len(actual) - 1} temporary_workflows=1")
+          PY
+
+      - name: Byte-compile affected Python surfaces
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m compileall -q \
+            python/freetoken/control_cli.py \
+            python/freetoken/message/frontend.py \
+            python/freetoken/message/tokenizer.py \
+            python/freetoken/moe/offload_cache.py \
+            python/freetoken/scheduler/scheduler.py \
+            python/freetoken/scheduler/status.py \
+            python/freetoken/server/args.py \
+            python/freetoken/server/stats.py \
+            python/freetoken/tokenizer/server.py \
+            tests/scheduler/test_abort_inflight_prefill.py \
+            tests/scheduler/test_scheduler_status.py \
+            tests/server/test_message_wire.py \
+            tests/server/test_moe_stats.py
+
+      - name: Verify telemetry and residency contracts coexist
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          args = Path("python/freetoken/server/args.py").read_text()
+          cache = Path("python/freetoken/moe/offload_cache.py").read_text()
+          scheduler = Path("python/freetoken/scheduler/scheduler.py").read_text()
+          stats = Path("python/freetoken/server/stats.py").read_text()
+          cli = Path("python/freetoken/control_cli.py").read_text()
+          wire_front = Path("python/freetoken/message/frontend.py").read_text()
+          wire_tok = Path("python/freetoken/message/tokenizer.py").read_text()
+          tests = Path("tests/server/test_moe_stats.py").read_text()
+
+          assert args.count('"--moe-collect-stats"') == 1
+          assert "Unset = automatic where" in args
+          assert "OS-locked instead of pinned" in args
+          assert "layer_residency" in cache
+          for key in ("active_experts", "missing_experts", "fetched_experts"):
+              assert f'"{key}"' in cache
+          assert "decode_status_emitted" in scheduler
+          assert "moe_cache.decode_miss_stats()" in scheduler
+          assert "h2d_payload_bytes" in stats
+          assert "Logical row payload, not sampled PCIe bus utilization" in stats
+          assert "moe_h2d payload_bytes=" in cli
+          assert "moe_layer_calls" in wire_front and "moe_layer_calls" in wire_tok
+          assert 'assert "bandwidth" not in rendered' in tests
+          print("PASS telemetry-residency-coexistence")
+          PY
