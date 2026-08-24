@@ -1,0 +1,115 @@
+name: Pin budget candidate validation
+
+on:
+  push:
+    branches:
+      - fix/native-windows-pin-budget
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Compile candidate source and regression
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            python/freetoken/engine/engine.py \
+            tests/engine/test_pin_budget.py
+
+      - name: Exercise exact pin-budget function without importing GPU dependencies
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import ast
+          import ctypes
+          from pathlib import Path
+          from types import SimpleNamespace
+
+          source_path = Path('python/freetoken/engine/engine.py')
+          tree = ast.parse(source_path.read_text(encoding='utf-8'), filename=str(source_path))
+          node = next(
+              n for n in tree.body
+              if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+              and n.name == '_pin_budget_bytes'
+          )
+          module = ast.Module(body=[node], type_ignores=[])
+          ast.fix_missing_locations(module)
+          namespace = {'os': None}
+          exec(compile(module, str(source_path), 'exec'), namespace)
+          fn = namespace['_pin_budget_bytes']
+
+          GIB = 2**30
+
+          class Query:
+              argtypes = None
+              restype = None
+
+              def __init__(self, total, *, succeeds=True):
+                  self.total = total
+                  self.succeeds = succeeds
+                  self.length = None
+
+              def __call__(self, ptr):
+                  status = ptr._obj
+                  self.length = int(status.dwLength)
+                  if not self.succeeds or self.length != 64:
+                      return 0
+                  status.ullTotalPhys = self.total
+                  return 1
+
+          # Explicit override wins before any platform-specific API access.
+          namespace['os'] = SimpleNamespace(
+              name='nt', environ={'FREETOKEN_PIN_BUDGET_GB': '3.5'}
+          )
+          assert fn() == int(3.5 * GIB)
+
+          # Native Windows uses total physical RAM, not current available RAM.
+          query = Query(64 * GIB)
+          ctypes.windll = SimpleNamespace(
+              kernel32=SimpleNamespace(GlobalMemoryStatusEx=query)
+          )
+          namespace['os'] = SimpleNamespace(name='nt', environ={})
+          assert fn() == int(64 * GIB * 0.4)
+          assert query.length == 64
+
+          # A failed Win32 query must not silently become the unsafe uncapped case.
+          query = Query(64 * GIB, succeeds=False)
+          ctypes.windll = SimpleNamespace(
+              kernel32=SimpleNamespace(GlobalMemoryStatusEx=query)
+          )
+          namespace['os'] = SimpleNamespace(name='nt', environ={})
+          try:
+              fn()
+          except OSError as exc:
+              assert 'GlobalMemoryStatusEx failed' in str(exc)
+          else:
+              raise AssertionError('failed Windows query was treated as successful/uncapped')
+
+          values = {'SC_PHYS_PAGES': 16 * 1024 * 1024, 'SC_PAGE_SIZE': 4096}
+          namespace['os'] = SimpleNamespace(
+              name='posix',
+              environ={},
+              uname=lambda: SimpleNamespace(release='6.8.0-microsoft-standard-WSL2'),
+              sysconf=values.__getitem__,
+          )
+          assert fn() == int(values['SC_PHYS_PAGES'] * 4096 * 0.4)
+
+          namespace['os'] = SimpleNamespace(
+              name='posix',
+              environ={},
+              uname=lambda: SimpleNamespace(release='6.8.0-64-generic'),
+          )
+          assert fn() is None
+
+          print('PIN_BUDGET_CANDIDATE_SEMANTICS_PASS')
+          PY
