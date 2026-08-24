@@ -1,0 +1,86 @@
+name: MoE stats rebuild fix validation
+
+on:
+  pull_request:
+    branches:
+      - validation/moe-stats-fix-base
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Apply bounded candidate patch in workspace
+        run: python3 .github/validation/apply_moe_stats_rebuild_epoch_fix.py
+
+      - name: Run source-level epoch regression
+        run: python3 tests/server/test_moe_stats_rebuild_epoch_source.py
+
+      - name: Install affected CPU test dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install \
+            pytest \
+            'apache-tvm-ffi==0.1.13.post3' \
+            'partial-json-parser==0.2.1.1.post7' \
+            'numpy>=2.0,<2.5' \
+            'pyzmq>=27,<28' \
+            'huggingface_hub>=1.5,<2' \
+            'transformers>=5.5,<6' \
+            'safetensors>=0.6,<1' \
+            'tqdm>=4.66,<5' \
+            'einops>=0.8,<1' \
+            'msgpack>=1.1,<2' \
+            'uvicorn>=0.30,<1' \
+            'fastapi>=0.115,<1' \
+            'openai>=2.0,<3'
+          python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.11.0'
+          python -m pip install --no-deps \
+            'triton==3.6.0' \
+            'flashlib==0.3.0'
+
+      - name: Run established affected CPU regression
+        env:
+          PYTHONPATH: python
+          TVM_FFI_CACHE_DIR: /tmp/freetoken-tvm-cache
+        run: |
+          python -m pytest -q \
+            tests/scheduler \
+            tests/server/test_message_wire.py \
+            tests/server/test_moe_stats.py \
+            tests/server/test_moe_stats_rebuild_epoch_source.py
+
+      - name: Diff hygiene
+        run: git diff --check
+
+      - name: Persist only validated product fix onto validation head
+        env:
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- \
+              python/freetoken/server/api_server.py \
+              python/freetoken/server/stats.py; then
+            echo 'product patch already committed; validation-only rerun'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add \
+            python/freetoken/server/api_server.py \
+            python/freetoken/server/stats.py
+          git commit -m 'fix(moe): reset telemetry epoch after cache rebuild'
+          git push origin "HEAD:${HEAD_BRANCH}"
