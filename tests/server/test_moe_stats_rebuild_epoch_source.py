@@ -58,6 +58,9 @@ def _state() -> SimpleNamespace:
     return SimpleNamespace(
         last_rebuild={"status": "ok", "moe_cache_size": 128},
         rebuild_futures={},
+        # A correct dispatch path records request intent rather than inferring it from
+        # the reply's final geometry. This also covers a same-size MoE cold rebuild.
+        moe_stats_reset_rebuilds={"rebuild-1"},
         fatal_error=None,
         maintenance_state="rebuilding",
         stats=_Stats(),
@@ -95,6 +98,7 @@ class MoeStatsRebuildEpochTests(unittest.TestCase):
             "successful MoE cache rebuild left the pre-rebuild frontend snapshot live",
         )
         self.assertEqual(state.stats.moe_layer_calls, 0)
+        self.assertNotIn("rebuild-1", state.moe_stats_reset_rebuilds)
 
     def test_failed_rebuild_does_not_discard_last_valid_snapshot(self) -> None:
         resolve = _resolve_rebuild_function()
@@ -105,6 +109,7 @@ class MoeStatsRebuildEpochTests(unittest.TestCase):
         self.assertEqual(state.maintenance_state, "failed")
         self.assertEqual(state.stats.reset_calls, 0)
         self.assertEqual(state.stats.moe_layer_calls, 80)
+        self.assertNotIn("rebuild-1", state.moe_stats_reset_rebuilds)
 
 
 if __name__ == "__main__":
