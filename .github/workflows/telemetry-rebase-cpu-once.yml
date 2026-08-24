@@ -1,0 +1,53 @@
+name: Telemetry rebase CPU once
+
+on:
+  pull_request:
+    branches:
+      - tmp/telemetry-merge-target-check
+
+permissions:
+  contents: read
+
+jobs:
+  affected-cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install bounded CPU test dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install \
+            pytest \
+            'numpy>=2.0,<2.5' \
+            'pyzmq>=27,<28' \
+            'huggingface_hub>=1.5,<2' \
+            'transformers>=5.5,<6' \
+            'safetensors>=0.6,<1' \
+            'tqdm>=4.66,<5' \
+            'einops>=0.8,<1' \
+            'msgpack>=1.1,<2'
+          python -m pip install \
+            --index-url https://download.pytorch.org/whl/cpu \
+            'torch==2.11.0'
+          python -m pip install --no-deps \
+            'triton==3.6.0' \
+            'flashlib==0.3.0'
+
+      - name: Run directly affected CPU tests
+        shell: bash
+        env:
+          PYTHONPATH: python
+          TVM_FFI_CACHE_DIR: /tmp/freetoken-tvm-cache
+        run: |
+          set -euo pipefail
+          python -m pytest -q \
+            tests/server/test_message_wire.py \
+            tests/server/test_moe_stats.py \
+            tests/scheduler/test_scheduler_status.py \
+            tests/scheduler/test_abort_inflight_prefill.py
