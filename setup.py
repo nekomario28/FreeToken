@@ -12,12 +12,16 @@ ROOT = Path(__file__).parent
 KERNEL_INCLUDE = str(ROOT / "python" / "freetoken" / "kernel" / "csrc" / "include")
 
 
-def _check_toolchain() -> None:
+def _toolchain_module():
     path = ROOT / "python" / "freetoken" / "kernel" / "_toolchain.py"
     spec = importlib.util.spec_from_file_location("_freetoken_toolchain", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    module.check_nvcc_matches_torch()
+    return module
+
+
+def _check_toolchain() -> None:
+    _toolchain_module().check_nvcc_matches_torch()
 
 
 def _is_rocm() -> bool:
@@ -46,9 +50,11 @@ def _rocm_paths() -> tuple[list[str], list[str], str]:
             continue
         if (library_dir / "libamdhip64.so").exists():
             return [str(include_dir)], [str(library_dir)], "amdhip64"
-        versioned = sorted(library_dir.glob("libamdhip64.so.*"))
-        if versioned:
-            return [str(include_dir)], [str(library_dir)], f":{versioned[-1].name}"
+        versioned = _toolchain_module().select_versioned_rocm_runtime(
+            library_dir.glob("libamdhip64.so.*")
+        )
+        if versioned is not None:
+            return [str(include_dir)], [str(library_dir)], f":{versioned.name}"
 
     searched = ", ".join(str(path) for path in dict.fromkeys(candidates))
     raise RuntimeError(
