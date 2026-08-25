@@ -143,6 +143,10 @@ class FrontendManager:
     # Runtime cache-rebuild control plane (correlated by uuid request_id, separate from
     # the int-uid generation ack machinery).
     rebuild_futures: Dict[str, asyncio.Future] = field(default_factory=dict)
+    # MoE-resize requests whose successful terminal reply starts a new telemetry epoch.
+    # Keep request intent separate from final geometry: a same-size cold rebuild still resets
+    # device counters, and a timed-out HTTP waiter may receive its terminal reply later.
+    moe_stats_reset_rebuilds: set[str] = field(default_factory=set)
     # Lifecycle gate. Starts "loading" (uvicorn binds before weights finish; the three
     # API adapters 503 until this flips) -> "serving" once all workers ack ready ->
     # "rebuilding"/"failed" for runtime cache rebuilds.
@@ -277,6 +281,10 @@ class FrontendManager:
             "num_swa_pages": msg.num_swa_pages,
             "error": msg.error,
         }
+        reset_moe_snapshot = msg.request_id in self.moe_stats_reset_rebuilds
+        self.moe_stats_reset_rebuilds.discard(msg.request_id)
+        if msg.status == "ok" and reset_moe_snapshot:
+            self.stats.reset_moe_snapshot()
         fut = self.rebuild_futures.pop(msg.request_id, None)
         if fut is not None and not fut.done():
             fut.set_result(self.last_rebuild)
@@ -299,6 +307,9 @@ class FrontendManager:
         result = {"status": "failed", "error": message}
 
         def _resolve_all() -> None:
+            # No terminal rebuild reply can arrive after the backend dies. Drop every
+            # telemetry-epoch intent, including one whose HTTP waiter already timed out.
+            self.moe_stats_reset_rebuilds.clear()
             for request_id in list(self.rebuild_futures):
                 fut = self.rebuild_futures.pop(request_id, None)
                 if fut is not None and not fut.done():
@@ -513,6 +524,8 @@ async def dispatch_rebuild(
     request_id = str(uuid.uuid4())
     fut = asyncio.get_running_loop().create_future()
     state.rebuild_futures[request_id] = fut
+    if moe_cache_size is not None:
+        state.moe_stats_reset_rebuilds.add(request_id)
     state.maintenance_state = "rebuilding"
     try:
         await state.send_one(
@@ -530,6 +543,7 @@ async def dispatch_rebuild(
         # untouched. Roll the gate back to serving (else a transient ZMQ error would latch
         # maintenance forever with no reply ever arriving to clear it) and surface the error.
         state.rebuild_futures.pop(request_id, None)
+        state.moe_stats_reset_rebuilds.discard(request_id)
         state.maintenance_state = "serving"
         return {"status": "failed", "error": f"failed to dispatch rebuild: {e!r}"}
     try:

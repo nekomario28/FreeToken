@@ -42,6 +42,13 @@ class StatsTracker:
         self.moe_missing_experts = 0
         self.moe_fetched_experts = 0
 
+    def reset_moe_snapshot(self) -> None:
+        """Invalidate the last throttled MoE snapshot at a device-counter epoch boundary."""
+        self.moe_layer_calls = 0
+        self.moe_active_experts = 0
+        self.moe_missing_experts = 0
+        self.moe_fetched_experts = 0
+
     @property
     def active(self) -> int:
         return len(self._inflight)
