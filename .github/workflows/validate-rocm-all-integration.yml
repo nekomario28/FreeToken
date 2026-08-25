@@ -1,0 +1,78 @@
+name: Validate ROCm all-PR integration
+
+on:
+  pull_request:
+    branches:
+      - work/rocm-all-pr-integration-20260825
+
+permissions:
+  contents: read
+
+jobs:
+  source-contracts:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ea820ce818b4a7d8246dc6c1f1e937a2632ff2ec
+          fetch-depth: 0
+
+      - name: Bind exact product head
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "ea820ce818b4a7d8246dc6c1f1e937a2632ff2ec"
+          test "$(git merge-base 2757bb5f91156fc8a44d88ec4b302a81f10c9e81 HEAD)" = "2757bb5f91156fc8a44d88ec4b302a81f10c9e81"
+          echo "ROCM_ALL_EXACT_HEAD=PASS"
+
+      - name: Diff hygiene and Python parse
+        run: |
+          set -euo pipefail
+          git diff --check 2757bb5f91156fc8a44d88ec4b302a81f10c9e81 HEAD
+          python -m compileall -q python/freetoken \
+            tests/engine/test_rocm_communication.py \
+            tests/kernels/test_backend.py \
+            tests/kernels/test_gguf_rocm.py \
+            tests/kernels/test_jit_index_store.py \
+            tests/kernels/test_rocm_host_pointer_capability.py \
+            tests/kernels/test_rocm_runtime_link_cache.py \
+            tests/kernels/test_rocm_versioned_runtime_selection.py \
+            tests/utils/test_rocm_arch.py \
+            setup.py
+          echo "ROCM_ALL_PARSE_AND_DIFF=PASS"
+
+      - name: Re-run validated PR132 correction contracts
+        run: |
+          set -euo pipefail
+          python tests/kernels/test_rocm_host_pointer_capability.py
+          python tests/kernels/test_rocm_versioned_runtime_selection.py
+          python tests/kernels/test_rocm_runtime_link_cache.py
+
+      - name: Verify integrated PR133-PR136 source semantics
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+
+          root = Path('.')
+          utils_cuh = (root/'python/freetoken/kernel/csrc/include/freetoken/utils.cuh').read_text()
+          index = (root/'python/freetoken/kernel/csrc/jit/index.cu').read_text()
+          store = (root/'python/freetoken/kernel/csrc/jit/store.cu').read_text()
+          backend = (root/'python/freetoken/kernel/backend.py').read_text()
+          engine = (root/'python/freetoken/engine/engine.py').read_text()
+          gguf = (root/'python/freetoken/kernel/gguf.py').read_text()
+          dispatch = (root/'python/freetoken/kernel/csrc/gguf/dispatch.h').read_text()
+
+          assert '#if FREETOKEN_USE_ROCM' in utils_cuh
+          assert '.with_device<kDLCUDA, kDLROCM>' in index
+          assert '.with_device<kDLCUDA, kDLROCM>' in store
+          assert 'def is_rocm()' in backend
+          assert 'PyNCCL is NVIDIA-only; using PyTorch' in engine
+          assert 'hipify' in gguf.lower() or 'rocm' in gguf.lower()
+          assert 'FREETOKEN_USE_ROCM' in dispatch or '__HIP_PLATFORM_AMD__' in dispatch or '__HIPCC__' in dispatch
+
+          print('ROCM_PR133_SOURCE=PASS')
+          print('ROCM_PR134_SOURCE=PASS')
+          print('ROCM_PR135_SOURCE=PASS')
+          print('ROCM_PR136_SOURCE=PASS')
+          PY
