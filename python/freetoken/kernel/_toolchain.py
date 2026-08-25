@@ -14,6 +14,24 @@ import subprocess
 
 ALLOW_MISMATCH_ENV = "FREETOKEN_ALLOW_CUDA_MISMATCH"
 _TRUE_VALUES = {"1", "true", "yes", "on"}
+_AMDHIP64_VERSIONED_RE = re.compile(r"libamdhip64\.so\.(\d+(?:\.\d+)*)$")
+
+
+def select_versioned_rocm_runtime(paths):
+    """Return the highest numeric libamdhip64 soname from ``paths``.
+
+    Path/string lexical order is not a version order: for example ``7.9`` sorts
+    after ``7.14``.  Keep this helper package-independent so both setup.py and
+    runtime JIT discovery can use the same selection contract.
+    """
+    candidates = []
+    for path in paths:
+        match = _AMDHIP64_VERSIONED_RE.fullmatch(os.path.basename(os.fspath(path)))
+        if match is None:
+            continue
+        version = tuple(int(part) for part in match.group(1).split("."))
+        candidates.append((version, os.fspath(path), path))
+    return max(candidates, key=lambda item: (item[0], item[1]))[2] if candidates else None
 
 
 def _is_rocm() -> bool:
