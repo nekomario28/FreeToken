@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib
 import os
 import pathlib
@@ -72,6 +73,11 @@ def _rocm_link_flags() -> List[str]:
     ROCm 7.14 Python SDK images only provide the versioned soname, while TVM-FFI
     still links with ``-lamdhip64``. Supply a cache-local unversioned symlink via
     an explicit linker search path without modifying the Python environment.
+
+    The compatibility directory is keyed by the resolved runtime origin so a
+    long-lived user cache cannot retain a link to a previous ROCm SDK after the
+    environment or image changes. Different tensor-parallel ranks using the same
+    runtime still converge on the same cache path.
     """
     candidates: list[pathlib.Path] = []
     if os.getenv("ROCM_HOME"):
@@ -96,15 +102,21 @@ def _rocm_link_flags() -> List[str]:
             versioned = sorted(library_dir.glob("libamdhip64.so.*"))
             if not versioned:
                 continue
-            link_dir = pathlib.Path.home() / ".cache" / "freetoken" / "rocm-lib"
+            runtime_target = versioned[-1].resolve()
+            cache_key = hashlib.sha256(str(runtime_target).encode("utf-8")).hexdigest()[:16]
+            link_dir = pathlib.Path.home() / ".cache" / "freetoken" / "rocm-lib" / cache_key
             link_dir.mkdir(parents=True, exist_ok=True)
             compat_link = link_dir / "libamdhip64.so"
-            if not compat_link.exists() and not compat_link.is_symlink():
+            if not compat_link.exists():
                 try:
-                    compat_link.symlink_to(versioned[-1])
+                    compat_link.symlink_to(runtime_target)
                 except FileExistsError:
                     # Multiple tensor-parallel ranks may prepare the same cache.
                     pass
+            if not compat_link.exists():
+                raise RuntimeError(
+                    f"ROCm runtime compatibility link is unavailable: {compat_link} -> {runtime_target}"
+                )
 
         return [f"-L{link_dir}", f"-Wl,-rpath,{library_dir}"]
 
