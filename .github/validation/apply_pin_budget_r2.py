@@ -1,0 +1,13 @@
+from pathlib import Path
+
+path = Path("python/freetoken/engine/engine.py")
+text = path.read_text(encoding="utf-8")
+old = '''def _pin_budget_bytes() -> int | None:\n    """Bytes this process can safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).\n\n    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere."""\n    if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):\n        return int(float(env) * 2**30)\n    if not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag\n        return None\n    return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)\n'''
+new = '''def _pin_budget_bytes() -> int | None:\n    """Bytes this process can safely cudaHostRegister, or None when pinning is uncapped.\n\n    WDDM-backed CUDA on native Windows and WSL caps pinning near half of host RAM,\n    shared across processes, so use a conservative 40% budget. The explicit\n    FREETOKEN_PIN_BUDGET_GB override wins on every platform.\n    """\n    if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):\n        return int(float(env) * 2**30)\n    if os.name == "nt":\n        import ctypes\n\n        class _MemoryStatusEx(ctypes.Structure):\n            _fields_ = [\n                ("dwLength", ctypes.c_uint32),\n                ("dwMemoryLoad", ctypes.c_uint32),\n                ("ullTotalPhys", ctypes.c_uint64),\n                ("ullAvailPhys", ctypes.c_uint64),\n                ("ullTotalPageFile", ctypes.c_uint64),\n                ("ullAvailPageFile", ctypes.c_uint64),\n                ("ullTotalVirtual", ctypes.c_uint64),\n                ("ullAvailVirtual", ctypes.c_uint64),\n                ("ullAvailExtendedVirtual", ctypes.c_uint64),\n            ]\n\n        status = _MemoryStatusEx()\n        status.dwLength = ctypes.sizeof(status)\n        query = ctypes.windll.kernel32.GlobalMemoryStatusEx\n        query.argtypes = [ctypes.POINTER(_MemoryStatusEx)]\n        query.restype = ctypes.c_int\n        if not query(ctypes.byref(status)):\n            raise OSError("GlobalMemoryStatusEx failed while detecting the Windows pin budget")\n        return int(status.ullTotalPhys * 0.4)\n    if not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag\n        return None\n    return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)\n'''
+if new in text:
+    print("PIN_BUDGET_R2_ALREADY_APPLIED")
+elif text.count(old) == 1:
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    print("PIN_BUDGET_R2_APPLIED")
+else:
+    raise SystemExit(f"expected one current-upstream pin-budget anchor, found {text.count(old)}")
