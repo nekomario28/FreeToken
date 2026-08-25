@@ -1,0 +1,76 @@
+name: TEMP PR132 current-main composition
+
+on:
+  pull_request:
+    branches:
+      - validation/pr132-current-main-composition
+
+permissions:
+  contents: read
+
+jobs:
+  source-contract:
+    runs-on: ubuntu-24.04
+    env:
+      MERGE_SHA: 66156d38240f1e17640c8e90fa7b7fdcc1c6c409
+      CANDIDATE_SHA: 9a72fcf4c2490f72e4fa05880d6315ba0279961c
+    steps:
+      - name: Check out exact carrier head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate current-main composition
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$CANDIDATE_SHA"
+          test "$(git rev-parse "$CANDIDATE_SHA^")" = "$MERGE_SHA"
+
+          expected=$'python/freetoken/kernel/_toolchain.py\npython/freetoken/kernel/csrc/include/freetoken/hip_compat.h\npython/freetoken/kernel/utils.py\nsetup.py\ntests/kernels/test_rocm_host_pointer_capability.py\ntests/kernels/test_rocm_runtime_link_cache.py\ntests/kernels/test_rocm_versioned_runtime_selection.py'
+          test "$(git diff --name-only "$MERGE_SHA" "$CANDIDATE_SHA" | sort)" = "$expected"
+          git diff --check "$MERGE_SHA" "$CANDIDATE_SHA"
+
+          test "$(git rev-parse "$CANDIDATE_SHA:python/freetoken/kernel/csrc/include/freetoken/hip_compat.h")" = 3cb5feaf28a137915cad8d97f2874becbf6345af
+          test "$(git rev-parse "$CANDIDATE_SHA:tests/kernels/test_rocm_host_pointer_capability.py")" = 2cf4a87eb907c5050978141f85a9dad62f8cacf8
+          test "$(git rev-parse "$CANDIDATE_SHA:python/freetoken/kernel/_toolchain.py")" = e4065bf811d4195fdb45901042263e28f89f0318
+          test "$(git rev-parse "$CANDIDATE_SHA:python/freetoken/kernel/utils.py")" = 533b122220429f61417d8e5400fba4e0478c9ea9
+          test "$(git rev-parse "$CANDIDATE_SHA:tests/kernels/test_rocm_runtime_link_cache.py")" = fb1b47cbc121dbd1d578b9787cebdf0743b20258
+          test "$(git rev-parse "$CANDIDATE_SHA:setup.py")" = 98ec6d74d398ac528b87bf6da1170290a2906faf
+          test "$(git rev-parse "$CANDIDATE_SHA:tests/kernels/test_rocm_versioned_runtime_selection.py")" = 6266766ab2a0006091ef7138d678ff64ad6f53d5
+          echo 'ROCM_CURRENT_MERGE_MATERIAL=EXACT_VALIDATED_BLOBS'
+
+          python -m py_compile \
+            python/freetoken/kernel/_toolchain.py \
+            python/freetoken/kernel/utils.py \
+            python/freetoken/gpu_select.py \
+            setup.py \
+            tests/kernels/test_rocm_host_pointer_capability.py \
+            tests/kernels/test_rocm_runtime_link_cache.py \
+            tests/kernels/test_rocm_versioned_runtime_selection.py
+
+          PYTHONPATH="$PWD/python" python tests/kernels/test_rocm_host_pointer_capability.py
+          PYTHONPATH="$PWD/python" python tests/kernels/test_rocm_versioned_runtime_selection.py
+          PYTHONPATH="$PWD/python" python tests/kernels/test_rocm_runtime_link_cache.py
+
+          python - <<'PY'
+          import importlib.util
+          from pathlib import Path
+
+          path = Path('python/freetoken/gpu_select.py').resolve()
+          spec = importlib.util.spec_from_file_location('_gpu_select_current_merge', path)
+          assert spec is not None and spec.loader is not None
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+
+          module._nvml_uuids = lambda: None
+          assert module.resolve_gpu_uuids(('0',)) is None
+          module._assigned_physical = None
+          module._assigned_visible = None
+          module.set_assigned_gpu('0')
+          assert module._assigned_physical is None
+          assert module._assigned_visible == 0
+          print('ROCM_CURRENT_MERGE_GPU_SELECT=PASS_NVML_OPTIONAL_VISIBLE_INDEX')
+          PY
+
+          echo 'ROCM_CURRENT_MERGE_COMPOSITION=PASS_SOURCE_CONTRACTS'
