@@ -1,0 +1,59 @@
+name: TEMP PR132 ROCm JIT runtime resolution A-B r2
+
+on:
+  pull_request:
+    branches:
+      - fix/pr132-rocm-jit-runtime-resolution
+
+permissions:
+  contents: read
+
+jobs:
+  discriminate:
+    runs-on: ubuntu-24.04
+    env:
+      BASE_SHA: 2ccee21c1298377f7c6c211e44165f60c3039f7f
+      CANDIDATE_SHA: 9c8050ea186329b5d958f0c29e8fbc3d90f86fd0
+    steps:
+      - name: Check out exact carrier head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Prove lifetime baseline green, lexical baseline red, candidate green
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$CANDIDATE_SHA"
+          git merge-base --is-ancestor "$BASE_SHA" "$CANDIDATE_SHA"
+
+          base_root="$RUNNER_TEMP/base"
+          candidate_root="$RUNNER_TEMP/candidate"
+          git worktree add --detach "$base_root" "$BASE_SHA"
+          git worktree add --detach "$candidate_root" "$CANDIDATE_SHA"
+
+          PYTHONPATH="$base_root/python" python "$base_root/tests/kernels/test_rocm_runtime_link_cache.py"
+          echo 'ROCM_JIT_RUNTIME_BASE_LIFETIME=PASS'
+
+          cp "$candidate_root/tests/kernels/test_rocm_runtime_link_cache.py" "$base_root/tests/kernels/test_rocm_runtime_link_cache.py"
+          set +e
+          PYTHONPATH="$base_root/python" python "$base_root/tests/kernels/test_rocm_runtime_link_cache.py" >"$RUNNER_TEMP/base-numeric.log" 2>&1
+          base_rc=$?
+          set -e
+          test "$base_rc" -ne 0
+          grep -Fq 'AssertionError' "$RUNNER_TEMP/base-numeric.log"
+          grep -Fq 'sorted(library_dir.glob("libamdhip64.so.*"))' "$base_root/python/freetoken/kernel/utils.py"
+          echo "ROCM_JIT_RUNTIME_NUMERIC_BASE_RC=$base_rc"
+          echo 'ROCM_JIT_RUNTIME_NUMERIC_BASE=EXPECTED_FAIL'
+
+          PYTHONPATH="$candidate_root/python" python "$candidate_root/tests/kernels/test_rocm_runtime_link_cache.py"
+          echo 'ROCM_JIT_RUNTIME_CANDIDATE=PASS'
+
+          test "$(git diff --name-only "$BASE_SHA" "$CANDIDATE_SHA" | sort)" = $'python/freetoken/kernel/_toolchain.py\npython/freetoken/kernel/utils.py\ntests/kernels/test_rocm_runtime_link_cache.py'
+          git diff --check "$BASE_SHA" "$CANDIDATE_SHA"
+          grep -Fq 'def _select_versioned_rocm_runtime' "$candidate_root/python/freetoken/kernel/utils.py"
+          grep -Fq 'spec_from_file_location' "$candidate_root/python/freetoken/kernel/utils.py"
+          ! grep -Fq 'sorted(library_dir.glob("libamdhip64.so.*"))' "$candidate_root/python/freetoken/kernel/utils.py"
+          echo 'ROCM_JIT_RUNTIME_RESOLUTION_AB=LIFETIME_GREEN_NUMERIC_BASE_RED_FIX_GREEN'
