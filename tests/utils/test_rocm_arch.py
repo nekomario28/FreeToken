@@ -80,8 +80,10 @@ def test_rocm_link_flags_support_versioned_modular_sdk(monkeypatch, tmp_path):
 
     flags = utils._rocm_link_flags()
 
-    compat_dir = tmp_path / ".cache" / "freetoken" / "rocm-lib"
+    compat_root = tmp_path / ".cache" / "freetoken" / "rocm-lib"
+    compat_dir = pathlib.Path(next(flag[2:] for flag in flags if flag.startswith("-L")))
     compat_link = compat_dir / "libamdhip64.so"
+    assert compat_dir.parent == compat_root
     assert f"-L{compat_dir}" in flags
     assert f"-Wl,-rpath,{library_dir}" in flags
     assert compat_link.resolve() == versioned_runtime.resolve()
