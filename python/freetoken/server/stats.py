@@ -37,6 +37,17 @@ class StatsTracker:
         self.swa_used_tokens = 0
         self.swa_total_tokens = 0
         self.vram_bytes = 0
+        self.moe_layer_calls = 0
+        self.moe_active_experts = 0
+        self.moe_missing_experts = 0
+        self.moe_fetched_experts = 0
+
+    def reset_moe_snapshot(self) -> None:
+        """Invalidate the last throttled MoE snapshot at a device-counter epoch boundary."""
+        self.moe_layer_calls = 0
+        self.moe_active_experts = 0
+        self.moe_missing_experts = 0
+        self.moe_fetched_experts = 0
 
     @property
     def active(self) -> int:
@@ -74,6 +85,11 @@ class StatsTracker:
             self.swa_total_tokens = reply.swa_total_tokens
         if getattr(reply, "gpu_mem_bytes", 0) > 0:
             self.vram_bytes = reply.gpu_mem_bytes
+        if getattr(reply, "moe_layer_calls", 0) > 0:
+            self.moe_layer_calls = reply.moe_layer_calls
+            self.moe_active_experts = reply.moe_active_experts
+            self.moe_missing_experts = reply.moe_missing_experts
+            self.moe_fetched_experts = reply.moe_fetched_experts
         if getattr(reply, "finished", False):
             uid = getattr(reply, "uid", None)
             if uid in self._inflight:
@@ -152,6 +168,27 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
          "page_size": sps}
         if tr.swa_total_tokens > 0 else None
     )
+    unit_bytes = getattr(state, "unit_bytes", None) or {}
+    bytes_per_expert = int(unit_bytes.get("moe_bytes_per_expert", 0) or 0)
+    moe = None
+    if tr.moe_layer_calls > 0:
+        hits = max(0, tr.moe_active_experts - tr.moe_missing_experts)
+        host_computed = max(0, tr.moe_missing_experts - tr.moe_fetched_experts)
+        moe = {
+            "scope": "decode_since_start_or_cache_rebuild",
+            "layer_calls": tr.moe_layer_calls,
+            "active_experts": tr.moe_active_experts,
+            "cache_hits": hits,
+            "cache_misses": tr.moe_missing_experts,
+            "cache_hit_rate": round(hits / tr.moe_active_experts, 4)
+            if tr.moe_active_experts else 0.0,
+            "fetched_experts": tr.moe_fetched_experts,
+            "host_computed_experts": host_computed,
+            "bytes_per_expert": bytes_per_expert,
+            # Logical row payload, not sampled PCIe bus utilization. Transport overhead
+            # and overlap require timing support that these counters do not provide.
+            "h2d_payload_bytes": tr.moe_fetched_experts * bytes_per_expert,
+        }
     return {
         "instance_id": getattr(state, "instance_id", None),
         "model": derive_model_card(config),
@@ -159,6 +196,7 @@ def build_stats(state: Any, p95_ms: int, ttft_mean_ms: int) -> dict:
         "kv": kv,
         "mamba": mamba,
         "swa": swa,
+        "moe": moe,
         "vram_bytes": tr.vram_bytes,
         "gpus": list(getattr(state, "gpus", None) or []),
         "throughput": {

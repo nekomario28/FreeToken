@@ -103,12 +103,14 @@ def test_decode_lines_are_throttled_to_every_nth_forward():
     rep, logs, clock = _reporter(interval=3)
     for i, t in enumerate((1.0, 1.5), start=1):
         clock["t"] = t
-        rep.report_batch(_decode_batch(2), running_reqs=2, queue_reqs=0,
-                         kv_used_pages=60, kv_total_pages=200, page_size=16)
+        emitted = rep.report_batch(_decode_batch(2), running_reqs=2, queue_reqs=0,
+                                   kv_used_pages=60, kv_total_pages=200, page_size=16)
+        assert emitted is False
         assert logs == [], f"should not log before the interval (forward {i})"
     clock["t"] = 2.0  # 3rd forward -> log; 6 tokens over 2.0s gap -> 3 tok/s
-    rep.report_batch(_decode_batch(2), running_reqs=2, queue_reqs=4,
-                     kv_used_pages=62, kv_total_pages=200, page_size=16)
+    emitted = rep.report_batch(_decode_batch(2), running_reqs=2, queue_reqs=4,
+                               kv_used_pages=62, kv_total_pages=200, page_size=16)
+    assert emitted is True
     assert len(logs) == 1
     line = logs[0]
     assert "#running-req: 2" in line
