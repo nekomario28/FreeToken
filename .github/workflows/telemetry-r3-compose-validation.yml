@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
 
+# User-owned retrigger after the first run persisted the 15-file product composition.
 jobs:
   compose-and-validate:
     runs-on: ubuntu-24.04
