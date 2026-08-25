@@ -1159,11 +1159,38 @@ def _cpu_moe_executor_viable(model_config) -> bool:
 
 
 def _pin_budget_bytes() -> int | None:
-    """Bytes this process can safely cudaHostRegister, or None when the platform does not cap pinning (plain Linux).
+    """Bytes this process can safely cudaHostRegister, or None when pinning is uncapped.
 
-    WSL's WDDM-backed CUDA caps pinning near half of RAM, shared across processes -- budget 40%. FREETOKEN_PIN_BUDGET_GB overrides anywhere."""
+    WDDM-backed CUDA on native Windows and WSL caps pinning near half of host RAM,
+    shared across processes, so use a conservative 40% budget. The explicit
+    FREETOKEN_PIN_BUDGET_GB override wins on every platform.
+    """
     if env := os.environ.get("FREETOKEN_PIN_BUDGET_GB"):
         return int(float(env) * 2**30)
+    if os.name == "nt":
+        import ctypes
+
+        class _MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_uint32),
+                ("dwMemoryLoad", ctypes.c_uint32),
+                ("ullTotalPhys", ctypes.c_uint64),
+                ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64),
+                ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64),
+                ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64),
+            ]
+
+        status = _MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(status)
+        query = ctypes.windll.kernel32.GlobalMemoryStatusEx
+        query.argtypes = [ctypes.POINTER(_MemoryStatusEx)]
+        query.restype = ctypes.c_int
+        if not query(ctypes.byref(status)):
+            raise OSError("GlobalMemoryStatusEx failed while detecting the Windows pin budget")
+        return int(status.ullTotalPhys * 0.4)
     if not hasattr(os, "uname") or "microsoft" not in os.uname().release.lower():  # WSL kernel tag
         return None
     return int(os.sysconf("SC_PHYS_PAGES") * os.sysconf("SC_PAGE_SIZE") * 0.4)
