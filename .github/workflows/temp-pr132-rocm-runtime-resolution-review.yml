@@ -1,0 +1,52 @@
+name: TEMP PR132 ROCm runtime resolution review
+
+on:
+  pull_request:
+    branches:
+      - fix/pr132-rocm-runtime-resolution-review
+
+permissions:
+  contents: read
+
+jobs:
+  source-contract:
+    runs-on: ubuntu-24.04
+    env:
+      BASE_SHA: 45417560beeba896a9b0866e50154d2a7a320b8b
+      CANDIDATE_SHA: af92ee33e5219c07b86a3950208fd60a5541134f
+    steps:
+      - name: Check out exact carrier head
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Validate one-change runtime resolution candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "$CANDIDATE_SHA"
+          test "$(git rev-parse "$CANDIDATE_SHA^")" = "$BASE_SHA"
+
+          expected=$'python/freetoken/kernel/_toolchain.py\npython/freetoken/kernel/utils.py\nsetup.py\ntests/kernels/test_rocm_runtime_link_cache.py\ntests/kernels/test_rocm_versioned_runtime_selection.py'
+          test "$(git diff --name-only "$BASE_SHA" "$CANDIDATE_SHA" | sort)" = "$expected"
+          git diff --check "$BASE_SHA" "$CANDIDATE_SHA"
+
+          test "$(git rev-parse "$CANDIDATE_SHA:python/freetoken/kernel/_toolchain.py")" = e4065bf811d4195fdb45901042263e28f89f0318
+          test "$(git rev-parse "$CANDIDATE_SHA:python/freetoken/kernel/utils.py")" = 533b122220429f61417d8e5400fba4e0478c9ea9
+          test "$(git rev-parse "$CANDIDATE_SHA:setup.py")" = 98ec6d74d398ac528b87bf6da1170290a2906faf
+          test "$(git rev-parse "$CANDIDATE_SHA:tests/kernels/test_rocm_runtime_link_cache.py")" = fb1b47cbc121dbd1d578b9787cebdf0743b20258
+          test "$(git rev-parse "$CANDIDATE_SHA:tests/kernels/test_rocm_versioned_runtime_selection.py")" = 6266766ab2a0006091ef7138d678ff64ad6f53d5
+          echo 'ROCM_RUNTIME_RESOLUTION_REVIEW_MATERIAL=EXACT_VALIDATED_BLOBS'
+
+          python -m py_compile \
+            python/freetoken/kernel/_toolchain.py \
+            python/freetoken/kernel/utils.py \
+            setup.py \
+            tests/kernels/test_rocm_runtime_link_cache.py \
+            tests/kernels/test_rocm_versioned_runtime_selection.py
+
+          PYTHONPATH="$PWD/python" python tests/kernels/test_rocm_versioned_runtime_selection.py
+          PYTHONPATH="$PWD/python" python tests/kernels/test_rocm_runtime_link_cache.py
+          echo 'ROCM_RUNTIME_RESOLUTION_REVIEW=PASS_BUILD_AND_JIT_CONTRACTS'
