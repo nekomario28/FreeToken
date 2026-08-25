@@ -1,0 +1,119 @@
+name: Pin budget r2 clean exact-head validation
+
+on:
+  pull_request:
+    branches:
+      - fix/native-windows-pin-budget-upstream-ready-r2
+
+permissions:
+  contents: read
+
+jobs:
+  clean-r2:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 8
+    steps:
+      - name: Checkout exact PR head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Bind clean ancestry, scope, and material blobs
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "52349e775624c9fa6d2ddd23652375905adca17d"
+          test "$(git rev-parse HEAD^^)" = "2757bb5f91156fc8a44d88ec4b302a81f10c9e81"
+          test "$(git rev-parse HEAD^:python/freetoken/engine/engine.py)" = "81815442e8993274547b7a49a0fffc26c73c5d14"
+          test "$(git rev-parse HEAD^:tests/engine/test_pin_budget.py)" = "26eee9114868084df0540e61a5b0f6a9b702d29a"
+          actual="$(git diff --name-only HEAD^^ HEAD^ | sort)"
+          expected="$(printf '%s\n' python/freetoken/engine/engine.py tests/engine/test_pin_budget.py | sort)"
+          test "$actual" = "$expected"
+          echo PIN_BUDGET_R2_CLEAN_IDENTITY_OK
+
+      - name: Compile exact product and regression
+        shell: bash
+        run: python -m py_compile python/freetoken/engine/engine.py tests/engine/test_pin_budget.py
+
+      - name: Exercise exact pin-budget function contract
+        shell: bash
+        run: |
+          python - <<'PY'
+          import ast
+          import ctypes
+          import os
+          from pathlib import Path
+          from types import SimpleNamespace
+
+          path = Path('python/freetoken/engine/engine.py')
+          tree = ast.parse(path.read_text(encoding='utf-8'))
+          fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == '_pin_budget_bytes')
+          unit = ast.Module(body=[fn], type_ignores=[])
+          ns = {'os': os}
+          exec(compile(unit, str(path), 'exec'), ns)
+          pin_budget = ns['_pin_budget_bytes']
+          gib = 2**30
+
+          # Explicit override must outrank platform detection everywhere.
+          ns['os'] = SimpleNamespace(name='nt', environ={'FREETOKEN_PIN_BUDGET_GB': '3.5'})
+          assert pin_budget() == int(3.5 * gib)
+
+          if os.name == 'nt':
+              # Exercise the exact function against the real Win32 API on the Windows runner.
+              ns['os'] = os
+              old = os.environ.pop('FREETOKEN_PIN_BUDGET_GB', None)
+              try:
+                  value = pin_budget()
+              finally:
+                  if old is not None:
+                      os.environ['FREETOKEN_PIN_BUDGET_GB'] = old
+              assert isinstance(value, int) and value > 0
+              print(f'PIN_BUDGET_R2_REAL_WINDOWS_OK bytes={value}')
+          else:
+              class FakeQuery:
+                  argtypes = None
+                  restype = None
+                  def __init__(self, total): self.total = total
+                  def __call__(self, ptr):
+                      status = ptr._obj
+                      assert int(status.dwLength) == 64
+                      status.ullTotalPhys = self.total
+                      return 1
+
+              query = FakeQuery(64 * gib)
+              old_windll = getattr(ctypes, 'windll', None)
+              had_windll = hasattr(ctypes, 'windll')
+              ctypes.windll = SimpleNamespace(kernel32=SimpleNamespace(GlobalMemoryStatusEx=query))
+              try:
+                  ns['os'] = SimpleNamespace(name='nt', environ={})
+                  assert pin_budget() == int(64 * gib * 0.4)
+              finally:
+                  if had_windll:
+                      ctypes.windll = old_windll
+                  else:
+                      delattr(ctypes, 'windll')
+
+              vals = {'SC_PHYS_PAGES': 16 * 1024 * 1024, 'SC_PAGE_SIZE': 4096}
+              ns['os'] = SimpleNamespace(
+                  name='posix', environ={},
+                  uname=lambda: SimpleNamespace(release='6.8.0-microsoft-standard-WSL2'),
+                  sysconf=vals.__getitem__,
+              )
+              assert pin_budget() == int(vals['SC_PHYS_PAGES'] * vals['SC_PAGE_SIZE'] * 0.4)
+              ns['os'] = SimpleNamespace(
+                  name='posix', environ={},
+                  uname=lambda: SimpleNamespace(release='6.8.0-64-generic'),
+              )
+              assert pin_budget() is None
+              print('PIN_BUDGET_R2_SYNTHETIC_PLATFORM_CONTRACT_OK')
+          PY
+
+      - name: Diff hygiene
+        shell: bash
+        run: git diff --check HEAD^^ HEAD^
