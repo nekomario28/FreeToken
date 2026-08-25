@@ -65,6 +65,17 @@ def _hip_cflags(extra: List[str]) -> List[str]:
     return flags + [f"--offload-arch={arch}" for arch in arches]
 
 
+def _select_versioned_rocm_runtime(paths):
+    """Load the standalone toolchain selector without importing kernel package state."""
+    path = pathlib.Path(__file__).with_name("_toolchain.py")
+    spec = importlib.util.spec_from_file_location("_freetoken_toolchain_runtime", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load ROCm runtime selector from {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.select_versioned_rocm_runtime(paths)
+
+
 @cache
 def _rocm_link_flags() -> List[str]:
     """Make ROCm's runtime library discoverable to JIT link commands.
@@ -94,14 +105,12 @@ def _rocm_link_flags() -> List[str]:
         candidates.append(pathlib.Path(next(iter(spec.submodule_search_locations))))
     candidates.append(pathlib.Path("/opt/rocm"))
 
-    from freetoken.kernel._toolchain import select_versioned_rocm_runtime
-
     for rocm_home in dict.fromkeys(candidates):
         library_dir = rocm_home / "lib"
         unversioned = library_dir / "libamdhip64.so"
         link_dir = library_dir
         if not unversioned.exists():
-            versioned = select_versioned_rocm_runtime(library_dir.glob("libamdhip64.so.*"))
+            versioned = _select_versioned_rocm_runtime(library_dir.glob("libamdhip64.so.*"))
             if versioned is None:
                 continue
             runtime_target = versioned.resolve()
