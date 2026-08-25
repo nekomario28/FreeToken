@@ -86,6 +86,7 @@ See [models.md](models.md#moe-backends) for what each backend does.
 | `--moe-cpu-layers` | all on GPU | With `offload`: which MoE layers decode on CPU (`3,7,11`, a count, or a fraction) |
 | `--moe-hybrid-max-fetch` | auto | With `hybrid`: max experts fetched over PCIe per layer per step; rest computed on CPU |
 | `--moe-prefill-hit-d2d` | off | Prefill: copy cache-hit experts device-side, stream only misses (CUDA >= 13) |
+| `--moe-collect-stats` | off | Expose throttled decode cache-hit and logical H2D payload counters in `/v1/stats` / `ft ctl stats` |
 | `--disable-moe-prefill-overlap` | overlap on | Disable the two-buffer prefill copy overlap |
 
 ### API behaviour

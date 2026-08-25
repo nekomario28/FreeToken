@@ -71,6 +71,10 @@ def test_user_reply_token_deltas_round_trip():
         kv_used_pages=40,
         kv_total_pages=512,
         gpu_mem_bytes=64 * (1 << 30),
+        moe_layer_calls=80,
+        moe_active_experts=640,
+        moe_missing_experts=160,
+        moe_fetched_experts=120,
     )
 
     decoded = BaseFrontendMsg.decoder(BaseFrontendMsg.encoder(msg))
@@ -85,6 +89,12 @@ def test_user_reply_token_deltas_round_trip():
     assert decoded.kv_used_pages == 40
     assert decoded.kv_total_pages == 512
     assert decoded.gpu_mem_bytes == 64 * (1 << 30)
+    assert (
+        decoded.moe_layer_calls,
+        decoded.moe_active_experts,
+        decoded.moe_missing_experts,
+        decoded.moe_fetched_experts,
+    ) == (80, 640, 160, 120)
 
 
 def test_detokenize_msg_carries_kv_usage_round_trip():
@@ -93,12 +103,20 @@ def test_detokenize_msg_carries_kv_usage_round_trip():
         kv_used_pages=10, kv_total_pages=256, gpu_mem_bytes=1 << 30,
         mamba_used_slots=7, mamba_total_slots=64,
         swa_used_tokens=8448, swa_total_tokens=76800,
+        moe_layer_calls=40, moe_active_experts=320,
+        moe_missing_experts=64, moe_fetched_experts=48,
     )
     decoded = BaseTokenizerMsg.decoder(BaseTokenizerMsg.encoder(msg))
     assert isinstance(decoded, DetokenizeMsg)
     assert (decoded.kv_used_pages, decoded.kv_total_pages, decoded.gpu_mem_bytes) == (10, 256, 1 << 30)
     assert (decoded.mamba_used_slots, decoded.mamba_total_slots) == (7, 64)
     assert (decoded.swa_used_tokens, decoded.swa_total_tokens) == (8448, 76800)
+    assert (
+        decoded.moe_layer_calls,
+        decoded.moe_active_experts,
+        decoded.moe_missing_experts,
+        decoded.moe_fetched_experts,
+    ) == (40, 320, 64, 48)
 
 
 def test_client_dicts_with_the_wire_tag_key_survive_intact():
