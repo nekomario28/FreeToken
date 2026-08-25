@@ -94,15 +94,17 @@ def _rocm_link_flags() -> List[str]:
         candidates.append(pathlib.Path(next(iter(spec.submodule_search_locations))))
     candidates.append(pathlib.Path("/opt/rocm"))
 
+    from freetoken.kernel._toolchain import select_versioned_rocm_runtime
+
     for rocm_home in dict.fromkeys(candidates):
         library_dir = rocm_home / "lib"
         unversioned = library_dir / "libamdhip64.so"
         link_dir = library_dir
         if not unversioned.exists():
-            versioned = sorted(library_dir.glob("libamdhip64.so.*"))
-            if not versioned:
+            versioned = select_versioned_rocm_runtime(library_dir.glob("libamdhip64.so.*"))
+            if versioned is None:
                 continue
-            runtime_target = versioned[-1].resolve()
+            runtime_target = versioned.resolve()
             cache_key = hashlib.sha256(str(runtime_target).encode("utf-8")).hexdigest()[:16]
             link_dir = pathlib.Path.home() / ".cache" / "freetoken" / "rocm-lib" / cache_key
             link_dir.mkdir(parents=True, exist_ok=True)
