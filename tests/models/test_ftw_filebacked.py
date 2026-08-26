@@ -16,6 +16,7 @@ _MODULE = importlib.util.module_from_spec(_MODULE_SPEC)
 _MODULE_SPEC.loader.exec_module(_MODULE)
 map_ftw_expert_entry = _MODULE.map_ftw_expert_entry
 map_ftw_cpu_layer_sources = _MODULE.map_ftw_cpu_layer_sources
+map_ftw_pageable_layer_sources = _MODULE.map_ftw_pageable_layer_sources
 
 
 def _write_index(tmp_path: Path, *, tensors: list[dict], shards: list[dict]) -> None:
@@ -148,3 +149,94 @@ def test_layer_sources_keep_existing_dict_of_layer_tensors_contract(tmp_path):
         map_ftw_cpu_layer_sources(tmp_path, 0, expected_banks={"gate_up_packed"})
     with pytest.raises(ValueError, match="no per-layer experts_bank entries"):
         map_ftw_cpu_layer_sources(tmp_path, 1)
+
+
+def test_mixed_pageable_overlay_maps_only_pageable_layers(tmp_path):
+    shard = tmp_path / "freetoken-00000.ftw"
+    raw = bytearray(20480)
+    entries = []
+    offsets = {
+        (0, "gate_up_packed"): 4096,
+        (0, "down_packed"): 8192,
+        (1, "gate_up_packed"): 12288,
+        (1, "down_packed"): 16384,
+    }
+    payloads = {
+        (0, "gate_up_packed"): b"\x01\x02\x03\x04",
+        (0, "down_packed"): b"\x05\x06\x07\x08",
+        (1, "gate_up_packed"): b"\x11\x12\x13\x14",
+        (1, "down_packed"): b"\x15\x16\x17\x18",
+    }
+    for (layer_id, bank), off in offsets.items():
+        payload = payloads[(layer_id, bank)]
+        raw[off : off + len(payload)] = payload
+        entries.append(
+            {
+                "name": f"{bank}#L{layer_id:05d}",
+                "kind": "experts_bank",
+                "dtype": "uint8",
+                "shape": [1, 4],
+                "global_off": off,
+                "nbytes": 4,
+            }
+        )
+    shard.write_bytes(raw)
+    _write_index(
+        tmp_path,
+        tensors=entries,
+        shards=[{"file": shard.name, "global_off": 0, "nbytes": len(raw)}],
+    )
+
+    overlay = map_ftw_pageable_layer_sources(
+        tmp_path,
+        num_layers=2,
+        expected_banks={"gate_up_packed", "down_packed"},
+        layer_residency=["pinned", "pageable"],
+    )
+
+    assert overlay["gate_up_packed"][0] is None
+    assert overlay["down_packed"][0] is None
+    assert overlay["gate_up_packed"][1].tolist() == [[17, 18, 19, 20]]
+    assert overlay["down_packed"][1].tolist() == [[21, 22, 23, 24]]
+
+    # The returned torch storage must retain the mmap after helper scope exits; writes stay COW.
+    gc.collect()
+    overlay["gate_up_packed"][1][0, 0] = 99
+    assert int(overlay["gate_up_packed"][1][0, 0]) == 99
+    assert shard.read_bytes()[12288:12292] == payloads[(1, "gate_up_packed")]
+
+
+def test_pageable_overlay_rejects_flat_layout_and_unknown_residency(tmp_path):
+    shard = tmp_path / "freetoken-00000.ftw"
+    raw = bytearray(8192)
+    raw[4096:4100] = b"\x01\x02\x03\x04"
+    shard.write_bytes(raw)
+    _write_index(
+        tmp_path,
+        tensors=[
+            {
+                "name": "gate_up_packed",
+                "kind": "experts_bank",
+                "dtype": "uint8",
+                "shape": [1, 4],
+                "global_off": 4096,
+                "nbytes": 4,
+            }
+        ],
+        shards=[{"file": shard.name, "global_off": 0, "nbytes": len(raw)}],
+    )
+
+    with pytest.raises(ValueError, match="legacy flat layout"):
+        map_ftw_pageable_layer_sources(
+            tmp_path,
+            num_layers=1,
+            expected_banks={"gate_up_packed"},
+            layer_residency=["pageable"],
+        )
+    with pytest.raises(ValueError, match="unknown host residency"):
+        map_ftw_pageable_layer_sources(
+            tmp_path,
+            num_layers=1,
+            expected_banks={"gate_up_packed"},
+            layer_residency=["mystery"],
+        )
