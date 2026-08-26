@@ -155,6 +155,7 @@ def test_missing_global_scale_fails_closed_before_sink(tmp_path):
         )
 
     assert calls == []
+    assert state == {"live_layers": 0, "max_live_layers": 1}
 
 
 def test_missing_entire_layer_fails_before_any_allocation(tmp_path):

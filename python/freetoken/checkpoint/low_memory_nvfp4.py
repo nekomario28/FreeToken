@@ -122,6 +122,8 @@ def stream_nvfp4_layers_serial(
 
     Returns counters suitable for conversion receipts/tests. The allocation bound is
     structural: the next layer is not allocated until the sink returns for the current one.
+    If source validation/read fails before handoff, the current layer is released immediately
+    so a failed conversion cannot leave resident anonymous pages behind.
     """
     folder, by_layer = _index_by_bank_layer(model_path, config, spec)
     E = int(config.num_experts)
@@ -142,83 +144,93 @@ def stream_nvfp4_layers_serial(
     bytes_streamed = 0
     for bank_layer in range(num_layers):
         banks = allocator(E, H, I)
-        gate_up_packed = banks["gate_up_packed"].tensor
-        gate_up_scale = banks["gate_up_scale"].tensor
-        gate_up_global = banks["gate_up_global"].tensor
-        down_packed = banks["down_packed"].tensor
-        down_scale = banks["down_scale"].tensor
-        down_global = banks["down_global"].tensor
+        sink_started = False
+        try:
+            gate_up_packed = banks["gate_up_packed"].tensor
+            gate_up_scale = banks["gate_up_scale"].tensor
+            gate_up_global = banks["gate_up_global"].tensor
+            down_packed = banks["down_packed"].tensor
+            down_scale = banks["down_scale"].tensor
+            down_global = banks["down_global"].tensor
 
-        # Tiny scalar globals are needed when the block scale is placed. Keep only this
-        # layer's E*3 scalars; never a whole-model globals map.
-        globals_map: dict[tuple[int, str], torch.Tensor] = {}
-        shards = by_layer[bank_layer]
-        for shard in sorted(shards):
-            path = os.path.join(folder, shard)
-            with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-                for name, match in shards[shard]:
-                    if match.group("kind") != "weight_scale_2":
-                        continue
-                    key = (int(match.group("expert")), match.group("proj"))
-                    globals_map[key] = f.get_tensor(name).reshape(1).to(torch.float16)
-                    tensors_read += 1
-            drop_page_cache(path)
+            # Tiny scalar globals are needed when the block scale is placed. Keep only this
+            # layer's E*3 scalars; never a whole-model globals map.
+            globals_map: dict[tuple[int, str], torch.Tensor] = {}
+            shards = by_layer[bank_layer]
+            for shard in sorted(shards):
+                path = os.path.join(folder, shard)
+                with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+                    for name, match in shards[shard]:
+                        if match.group("kind") != "weight_scale_2":
+                            continue
+                        key = (int(match.group("expert")), match.group("proj"))
+                        globals_map[key] = f.get_tensor(name).reshape(1).to(torch.float16)
+                        tensors_read += 1
+                drop_page_cache(path)
 
-        bulk_seen: set[tuple[int, str, str]] = set()
-        for shard in sorted(shards):
-            path = os.path.join(folder, shard)
-            with safetensors.safe_open(path, framework="pt", device="cpu") as f:
-                for name, match in shards[shard]:
-                    kind = match.group("kind")
-                    if kind == "weight_scale_2":
-                        continue
-                    expert = int(match.group("expert"))
-                    proj = match.group("proj")
-                    role = spec.proj_to_role[proj]
-                    tensor = f.get_tensor(name)
-                    if kind == "weight":
-                        if role == "gate":
-                            gate_up_packed[expert, :I] = tensor
-                        elif role == "up":
-                            gate_up_packed[expert, I:] = tensor
-                        elif role == "down":
-                            down_packed[expert] = tensor
+            bulk_seen: set[tuple[int, str, str]] = set()
+            for shard in sorted(shards):
+                path = os.path.join(folder, shard)
+                with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+                    for name, match in shards[shard]:
+                        kind = match.group("kind")
+                        if kind == "weight_scale_2":
+                            continue
+                        expert = int(match.group("expert"))
+                        proj = match.group("proj")
+                        role = spec.proj_to_role[proj]
+                        tensor = f.get_tensor(name)
+                        if kind == "weight":
+                            if role == "gate":
+                                gate_up_packed[expert, :I] = tensor
+                            elif role == "up":
+                                gate_up_packed[expert, I:] = tensor
+                            elif role == "down":
+                                down_packed[expert] = tensor
+                            else:
+                                raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
                         else:
-                            raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
-                    else:
-                        try:
-                            global_scale = globals_map[(expert, proj)]
-                        except KeyError as exc:
-                            raise ValueError(
-                                f"{spec.desc}: missing weight_scale_2 for bank layer "
-                                f"{bank_layer}, expert {expert}, projection {proj}"
-                            ) from exc
-                        if role == "gate":
-                            gate_up_scale[expert, :I] = tensor
-                            gate_up_global[expert, :I] = global_scale
-                        elif role == "up":
-                            gate_up_scale[expert, I:] = tensor
-                            gate_up_global[expert, I:] = global_scale
-                        elif role == "down":
-                            down_scale[expert] = tensor
-                            down_global[expert] = global_scale
-                        else:
-                            raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
-                    bulk_seen.add((expert, proj, kind))
-                    tensors_read += 1
-            drop_page_cache(path)
+                            try:
+                                global_scale = globals_map[(expert, proj)]
+                            except KeyError as exc:
+                                raise ValueError(
+                                    f"{spec.desc}: missing weight_scale_2 for bank layer "
+                                    f"{bank_layer}, expert {expert}, projection {proj}"
+                                ) from exc
+                            if role == "gate":
+                                gate_up_scale[expert, :I] = tensor
+                                gate_up_global[expert, :I] = global_scale
+                            elif role == "up":
+                                gate_up_scale[expert, I:] = tensor
+                                gate_up_global[expert, I:] = global_scale
+                            elif role == "down":
+                                down_scale[expert] = tensor
+                                down_global[expert] = global_scale
+                            else:
+                                raise ValueError(f"{spec.desc}: unknown projection role {role!r}")
+                        bulk_seen.add((expert, proj, kind))
+                        tensors_read += 1
+                drop_page_cache(path)
 
-        expected_bulk = E * 3 * 2
-        expected_globals = E * 3
-        if len(bulk_seen) != expected_bulk or len(globals_map) != expected_globals:
-            raise ValueError(
-                f"{spec.desc}: incomplete bank layer {bank_layer}: "
-                f"bulk={len(bulk_seen)}/{expected_bulk}, globals={len(globals_map)}/{expected_globals}"
-            )
+            expected_bulk = E * 3 * 2
+            expected_globals = E * 3
+            if len(bulk_seen) != expected_bulk or len(globals_map) != expected_globals:
+                raise ValueError(
+                    f"{spec.desc}: incomplete bank layer {bank_layer}: "
+                    f"bulk={len(bulk_seen)}/{expected_bulk}, globals={len(globals_map)}/{expected_globals}"
+                )
 
-        layer_bytes = sum(bank.nbytes for bank in banks.values())
-        layer_sink(bank_layer, banks)
-        bytes_streamed += layer_bytes
+            layer_bytes = sum(bank.nbytes for bank in banks.values())
+            # Handoff transfers release ownership to the sink. Converter sinks in this module
+            # and the canonical adapter both release in their own failure paths.
+            sink_started = True
+            layer_sink(bank_layer, banks)
+            bytes_streamed += layer_bytes
+        finally:
+            if not sink_started:
+                for bank in banks.values():
+                    bank.release()
+
         # The sink owns/releases ``banks`` before it returns. Crucially, no reference to
         # their tensors is retained here when the next layer is allocated.
 
