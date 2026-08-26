@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import importlib.util
-import json
+import logging
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -10,10 +12,27 @@ from safetensors.torch import save_file
 
 ROOT = Path(__file__).resolve().parents[2]
 MODULE_PATH = ROOT / "python/freetoken/experimental/safetensors_ftw_passthrough.py"
-SPEC = importlib.util.spec_from_file_location("safetensors_ftw_passthrough_under_test", MODULE_PATH)
-assert SPEC is not None and SPEC.loader is not None
-M = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(M)
+
+# ftw.py only needs init_logger at import time, but importing freetoken.utils eagerly pulls
+# the HF/Transformers stack. Keep this focused smoke on the storage primitive: provide the
+# exact tiny dependency during module load, then restore sys.modules immediately.
+_previous_utils = sys.modules.get("freetoken.utils")
+_logger_stub = types.ModuleType("freetoken.utils")
+_logger_stub.init_logger = lambda name: logging.getLogger(name)
+sys.modules["freetoken.utils"] = _logger_stub
+try:
+    SPEC = importlib.util.spec_from_file_location(
+        "safetensors_ftw_passthrough_under_test", MODULE_PATH
+    )
+    assert SPEC is not None and SPEC.loader is not None
+    M = importlib.util.module_from_spec(SPEC)
+    SPEC.loader.exec_module(M)
+finally:
+    if _previous_utils is None:
+        sys.modules.pop("freetoken.utils", None)
+    else:
+        sys.modules["freetoken.utils"] = _previous_utils
+
 Writer = M.BoundedPassthroughFTWWriter
 
 
