@@ -47,7 +47,7 @@ jobs:
             tests/models/test_ftw_filebacked.py \
             tests/checkpoint/test_mapped_ftw.py \
             tests/checkpoint/test_mapped_ftw_core_stdlib.py
-          pytest -q \
+          PYTHONPATH=python pytest -q \
             tests/models/test_nvfp4_low_memory_stream.py \
             tests/models/test_ftw_filebacked.py \
             tests/checkpoint/test_mapped_ftw.py \
