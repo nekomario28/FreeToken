@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,18 +110,34 @@ def test_adapter_fails_closed_outside_exact_converter_contract():
         loader("/model", qwen_config(quant="fp8_block"), **common)
 
 
-def test_temporary_loader_restores_original_on_success_and_failure():
-    original = object()
-    replacement = object()
+def test_temporary_loader_is_thread_scoped_and_restores_original_on_success_and_failure():
+    calls = []
+
+    def original(value):
+        calls.append(("original", value))
+        return "original"
+
+    def replacement(value):
+        calls.append(("replacement", value))
+        return "replacement"
+
     module = SimpleNamespace(load_expert_banks=original)
 
     with temporary_loader(module, replacement):
-        assert module.load_expert_banks is replacement
+        assert module.load_expert_banks("owner") == "replacement"
+        other_result = []
+        thread = threading.Thread(
+            target=lambda: other_result.append(module.load_expert_banks("other"))
+        )
+        thread.start()
+        thread.join()
+        assert other_result == ["original"]
     assert module.load_expert_banks is original
+    assert calls == [("replacement", "owner"), ("original", "other")]
 
     with pytest.raises(RuntimeError, match="boom"):
         with temporary_loader(module, replacement):
-            assert module.load_expert_banks is replacement
+            assert module.load_expert_banks("owner-2") == "replacement"
             raise RuntimeError("boom")
     assert module.load_expert_banks is original
 
