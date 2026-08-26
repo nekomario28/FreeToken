@@ -14,6 +14,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 make_loader = MODULE._make_low_memory_native_nvfp4_loader
 temporary_loader = MODULE._temporary_expert_loader
+require_preflight = MODULE._require_metadata_preflight
 
 
 def qwen_config(*, quant="nvfp4"):
@@ -122,3 +123,26 @@ def test_temporary_loader_restores_original_on_success_and_failure():
             assert module.load_expert_banks is replacement
             raise RuntimeError("boom")
     assert module.load_expert_banks is original
+
+
+def test_metadata_preflight_blocks_before_conversion_contract_is_entered():
+    calls = []
+
+    def blocked(model_path, out_dir):
+        calls.append((model_path, out_dir))
+        return {
+            "admission": "BLOCK",
+            "blockers": ["wrong architecture", "unsafe output"],
+        }
+
+    with pytest.raises(ValueError, match="wrong architecture; unsafe output"):
+        require_preflight("/model", "/out", preflight_fn=blocked)
+    assert calls == [("/model", "/out")]
+
+
+def test_metadata_preflight_accepts_only_explicit_unproven_state():
+    allowed = {"admission": "METADATA_OK_RESOURCE_UNPROVEN", "warnings": ["resource not proven"]}
+    assert require_preflight("/model", "/out", preflight_fn=lambda *_args: allowed) is allowed
+
+    with pytest.raises(ValueError, match="unexpected admission"):
+        require_preflight("/model", "/out", preflight_fn=lambda *_args: {"admission": "GO"})
