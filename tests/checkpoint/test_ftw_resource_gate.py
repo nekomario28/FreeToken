@@ -87,7 +87,6 @@ def test_preflight_legacy_fallback_remains_fail_closed(tmp_path):
     assert report.largest_source_tensor_bytes == 100
     assert report.expert_layer_bytes == 1056
     assert report.expert_bank_total_bytes == 2112
-    assert report.ram_guard_bytes == 1056 + 8 * 100 + GATE.DISk_FIXED_HEADROOM_BYTES if False else report.ram_guard_bytes
     assert report.ram_guard_bytes == 1056 + 8 * 100 + GATE.DISK_FIXED_HEADROOM_BYTES
     assert report.ram_model == "legacy_conservative_fallback"
     assert report.disk_model == "native_ftw_representation_envelope"
