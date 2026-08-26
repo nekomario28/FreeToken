@@ -9,10 +9,9 @@ import torch
 from safetensors.torch import save_file
 
 from freetoken.checkpoint.low_memory_nvfp4 import stream_nvfp4_layers_serial
-from freetoken.models.nvfp4_banks import Nvfp4ExpertSourceSpec
 
 
-_SPEC = Nvfp4ExpertSourceSpec(
+_SPEC = SimpleNamespace(
     key_pattern=re.compile(
         r"^layer\.(?P<layer>\d+)\.expert\.(?P<expert>\d+)\."
         r"(?P<proj>gate|up|down)\.(?P<kind>weight|weight_scale|weight_scale_2)$"
@@ -106,7 +105,6 @@ def test_streams_exactly_one_expert_layer_at_a_time(tmp_path):
 
     def sink(layer_id, banks):
         assert state["live_layers"] == 1
-        # The source constants make it easy to prove the layer landed in the right bank.
         expected = 10 * layer_id + 1
         assert int(banks["gate_up_packed"].tensor[0, 0, 0]) == expected
         assert int(banks["down_packed"].tensor[0, 0, 0]) == expected
@@ -153,7 +151,6 @@ def test_missing_global_scale_fails_closed_before_sink(tmp_path):
 
 def test_missing_entire_layer_fails_before_any_allocation(tmp_path):
     config = _checkpoint(tmp_path, layers=2)
-    # Rewrite the index to hide every tensor belonging to layer 1.
     index = json.loads((tmp_path / "model.safetensors.index.json").read_text())
     index["weight_map"] = {
         name: shard for name, shard in index["weight_map"].items() if not name.startswith("layer.1.")
