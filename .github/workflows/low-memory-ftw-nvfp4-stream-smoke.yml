@@ -5,6 +5,7 @@ on:
     branches:
       - work/low-memory-ftw-nvfp4-stream-20260826
       - work/file-backed-ftw-cpu-native-convert-20260826
+      - work/low-memory-ftw-dense-envelope-20260826
     paths:
       - "python/freetoken/checkpoint/low_memory_nvfp4.py"
       - "python/freetoken/checkpoint/ftw_filebacked.py"
@@ -14,6 +15,7 @@ on:
       - "python/freetoken/experimental/file_backed_ftw_cpu_server.py"
       - "python/freetoken/experimental/file_backed_ftw_cpu_convert.py"
       - "python/freetoken/experimental/file_backed_ftw_cpu_preflight.py"
+      - "python/freetoken/experimental/dense_conversion_envelope.py"
       - "python/freetoken/models/nvfp4_banks.py"
       - "tests/models/test_nvfp4_low_memory_stream.py"
       - "tests/models/test_nvfp4_bounded_converter_adapter.py"
@@ -26,6 +28,7 @@ on:
       - "tests/checkpoint/test_file_backed_ftw_cpu_server.py"
       - "tests/checkpoint/test_file_backed_ftw_cpu_convert.py"
       - "tests/checkpoint/test_file_backed_ftw_cpu_preflight.py"
+      - "tests/checkpoint/test_dense_conversion_envelope.py"
       - ".github/workflows/low-memory-ftw-nvfp4-stream-smoke.yml"
 
 permissions:
@@ -59,6 +62,7 @@ jobs:
             python/freetoken/experimental/file_backed_ftw_cpu_server.py \
             python/freetoken/experimental/file_backed_ftw_cpu_convert.py \
             python/freetoken/experimental/file_backed_ftw_cpu_preflight.py \
+            python/freetoken/experimental/dense_conversion_envelope.py \
             python/freetoken/models/nvfp4_banks.py \
             tests/models/test_nvfp4_low_memory_stream.py \
             tests/models/test_nvfp4_bounded_converter_adapter.py \
@@ -70,7 +74,8 @@ jobs:
             tests/checkpoint/test_mapped_ftw_tensor_owner.py \
             tests/checkpoint/test_file_backed_ftw_cpu_server.py \
             tests/checkpoint/test_file_backed_ftw_cpu_convert.py \
-            tests/checkpoint/test_file_backed_ftw_cpu_preflight.py
+            tests/checkpoint/test_file_backed_ftw_cpu_preflight.py \
+            tests/checkpoint/test_dense_conversion_envelope.py
           pytest -q \
             tests/models/test_nvfp4_low_memory_stream.py \
             tests/models/test_nvfp4_bounded_converter_adapter.py \
@@ -82,4 +87,5 @@ jobs:
             tests/checkpoint/test_mapped_ftw_tensor_owner.py \
             tests/checkpoint/test_file_backed_ftw_cpu_server.py \
             tests/checkpoint/test_file_backed_ftw_cpu_convert.py \
-            tests/checkpoint/test_file_backed_ftw_cpu_preflight.py
+            tests/checkpoint/test_file_backed_ftw_cpu_preflight.py \
+            tests/checkpoint/test_dense_conversion_envelope.py
