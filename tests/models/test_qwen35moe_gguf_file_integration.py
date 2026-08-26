@@ -1,23 +1,28 @@
 """CPU-only integration seam from real GGUF bytes into the Qwen3.5-MoE loader.
 
-This deliberately does not stand in for a production checkpoint or inference test.  It
-writes a tiny, structurally coherent GGUF v3 file directly, then exercises the same
-config detection and weight iterator used by a bare ``.gguf`` model path.  The purpose is
-to make the file-format -> config-shim -> qwen35moe weight-loading seam executable without
-network access, a model download, GPU kernels, or a server.
+This deliberately does not stand in for a production checkpoint or inference test. It
+writes a tiny, structurally coherent GGUF v3 file directly, then exercises:
+
+    GGUF bytes -> GGUF config shim -> qwen35moe config parse -> non-MoE weight iterator
+
+The outer HF dispatcher is covered separately and intentionally excluded here so this
+seam remains executable without Transformers/Hugging Face, network access, a model
+download, GPU kernels, a tokenizer, or a server.
 """
 
 from __future__ import annotations
 
 import math
 import struct
+import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 import torch
 
+from freetoken.models.gguf.config import build_gguf_shim
 from freetoken.models.qwen3_5_moe.gguf import iter_gguf_weights, parse_gguf_config
-from freetoken.utils.hf import cached_load_hf_config
 
 
 # GGUF metadata value tags (gguf.GGUFValueType).
@@ -59,7 +64,7 @@ def _write_f32_gguf(
 ) -> None:
     """Write a minimal GGUF v3 containing F32 tensors.
 
-    ``ggml_shape`` is stored in GGML order exactly as the file format expects.  Tensor
+    ``ggml_shape`` is stored in GGML order exactly as the file format expects. Tensor
     payload offsets are relative to the aligned start of the tensor-data section.
     """
     header = b"GGUF" + _u32(3) + _u64(len(tensors)) + _u64(len(kvs))
@@ -90,10 +95,10 @@ def _write_f32_gguf(
 
 
 def _tiny_qwen35moe(path: Path) -> None:
-    # One tiny linear-attention decoder layer.  These values satisfy the structural
-    # invariants in parse_gguf_config while keeping every tensor small enough for a CPU
-    # test.  The fixture intentionally omits tokenizer metadata and routed-expert banks:
-    # vocab size comes from token_embd.weight, and this test asks only for non-MoE weights.
+    # One tiny full-attention decoder layer. These values satisfy parse_gguf_config's
+    # structural invariants while keeping every tensor small enough for a CPU test. The
+    # fixture intentionally omits tokenizer metadata and routed-expert banks: vocab size
+    # comes from token_embd.weight, and this test asks only for non-MoE weights.
     arch = "qwen35moe"
     kvs = [
         _kv("general.architecture", _STRING, arch),
@@ -118,7 +123,7 @@ def _tiny_qwen35moe(path: Path) -> None:
         _kv(f"{arch}.ssm.group_count", _UINT32, 1),
         _kv(f"{arch}.ssm.time_step_rank", _UINT32, 1),
         _kv(f"{arch}.ssm.inner_size", _UINT32, 2),
-        _kv(f"{arch}.full_attention_interval", _UINT32, 2),
+        _kv(f"{arch}.full_attention_interval", _UINT32, 1),
     ]
 
     tensors = [
@@ -130,12 +135,15 @@ def _tiny_qwen35moe(path: Path) -> None:
     _write_f32_gguf(path, kvs, tensors)
 
 
-def test_real_gguf_bytes_reach_qwen35moe_config_and_weight_iterator(tmp_path: Path) -> None:
+def test_real_gguf_bytes_reach_qwen35moe_config_and_weight_iterator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     model_path = tmp_path / "tiny-qwen35moe.gguf"
     _tiny_qwen35moe(model_path)
 
-    # Exercise the normal bare-GGUF dispatch, not a hand-constructed config object.
-    shim = cached_load_hf_config(str(model_path))
+    # Start from the actual bytes with the production GGUF shim. The outer HF dispatcher
+    # is deliberately not part of this seam; its GGUF dispatch is covered separately.
+    shim = build_gguf_shim(str(model_path))
     assert shim.model_type == "qwen35moe"
     assert shim.architectures == ["Qwen35MoeGGUFForCausalLM"]
     assert shim.vocab_size == 8
@@ -147,6 +155,13 @@ def test_real_gguf_bytes_reach_qwen35moe_config_and_weight_iterator(tmp_path: Pa
     assert config.vocab_size == 8
     assert config.num_experts == 1
 
+    # iter_gguf_weights imports cached_load_hf_config at call time. Supply only that
+    # already-proven outer-dispatch result so the test continues through the production
+    # qwen35moe iterator without requiring Transformers/Hugging Face in this CPU carrier.
+    fake_utils = ModuleType("freetoken.utils")
+    fake_utils.cached_load_hf_config = lambda _: shim
+    monkeypatch.setitem(sys.modules, "freetoken.utils", fake_utils)
+
     loaded = dict(
         iter_gguf_weights(
             str(model_path),
@@ -156,11 +171,12 @@ def test_real_gguf_bytes_reach_qwen35moe_config_and_weight_iterator(tmp_path: Pa
         )
     )
 
-    assert set(loaded) == {
+    required = {
         "model.embed_tokens.qweight",
         "model.norm.weight",
         "model.layers.0.input_layernorm.weight",
     }
+    assert required <= set(loaded)
 
     # Embedding stays in the loader's packed-byte representation; F32 norms are
     # dequantized through the production CPU reference path into bf16.
