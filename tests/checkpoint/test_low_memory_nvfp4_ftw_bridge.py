@@ -172,6 +172,14 @@ def test_bridge_writer_failure_releases_current_layer_and_never_allocates_next(t
     assert len(writer.entries) == 2
 
 
+class FakeExpertBanks:
+    def __init__(self, quant_format, sources, *, streamed=False, **kwargs):
+        self.quant_format = quant_format
+        self.sources = sources
+        self.streamed = streamed
+        self.kwargs = kwargs
+
+
 def _qwen35_config():
     return SimpleNamespace(
         architectures=("Qwen3_5MoeForConditionalGeneration",),
@@ -179,25 +187,33 @@ def _qwen35_config():
     )
 
 
-def test_experimental_loader_routes_only_through_one_layer_stream(monkeypatch):
-    calls = []
-    sink = object()
-    monkeypatch.setattr(CONVERTER, "_source_spec_for_model", lambda _config: SPEC_NVFP4)
-
+def _loader_with_fake_stream(calls):
     def fake_stream(model_path, model_config, source_spec, layer_sink):
         calls.append((model_path, model_config, source_spec, layer_sink))
         return {"layers_streamed": 2}
 
-    monkeypatch.setattr(CONVERTER, "_stream_one_layer_at_a_time", fake_stream)
-    banks = CONVERTER._low_memory_load_expert_banks(
+    return CONVERTER._make_low_memory_loader(
+        FakeExpertBanks,
+        source_spec_for_model=lambda _config: SPEC_NVFP4,
+        stream_one_layer=fake_stream,
+    )
+
+
+def test_experimental_loader_routes_only_through_one_layer_stream():
+    calls = []
+    sink = object()
+    config = _qwen35_config()
+    loader = _loader_with_fake_stream(calls)
+
+    banks = loader(
         "/synthetic/model",
-        _qwen35_config(),
+        config,
         device=torch.device("cpu"),
         dtype=torch.bfloat16,
         layer_sink=sink,
     )
 
-    assert calls == [("/synthetic/model", calls[0][1], SPEC_NVFP4, sink)]
+    assert calls == [("/synthetic/model", config, SPEC_NVFP4, sink)]
     assert banks.quant_format == "nvfp4"
     assert banks.streamed is True
     assert set(banks.sources) == {
@@ -207,9 +223,9 @@ def test_experimental_loader_routes_only_through_one_layer_stream(monkeypatch):
     assert all(per_layer == [] for per_layer in banks.sources.values())
 
 
-def test_experimental_loader_fails_closed_outside_converter_contract(monkeypatch):
-    monkeypatch.setattr(CONVERTER, "_source_spec_for_model", lambda _config: SPEC_NVFP4)
-    monkeypatch.setattr(CONVERTER, "_stream_one_layer_at_a_time", lambda *args: None)
+def test_experimental_loader_fails_closed_outside_converter_contract():
+    calls = []
+    loader = _loader_with_fake_stream(calls)
     common = dict(
         model_path="/synthetic/model",
         model_config=_qwen35_config(),
@@ -218,26 +234,30 @@ def test_experimental_loader_fails_closed_outside_converter_contract(monkeypatch
     )
 
     with pytest.raises(ValueError, match="requires the canonical converter layer sink"):
-        CONVERTER._low_memory_load_expert_banks(**common)
+        loader(**common)
     with pytest.raises(ValueError, match="does not support dummy"):
-        CONVERTER._low_memory_load_expert_banks(**common, dummy=True, layer_sink=object())
+        loader(**common, dummy=True, layer_sink=object())
     with pytest.raises(ValueError, match="owns serial one-layer"):
-        CONVERTER._low_memory_load_expert_banks(**common, parallel=True, layer_sink=object())
+        loader(**common, parallel=True, layer_sink=object())
     with pytest.raises(ValueError, match="does not accept a serving residency plan"):
-        CONVERTER._low_memory_load_expert_banks(
-            **common, layer_sink=object(), layer_residency=["pageable"]
-        )
+        loader(**common, layer_sink=object(), layer_residency=["pageable"])
+    assert calls == []
+
+
+def _fake_expert_banks_module():
+    def original_loader(*_args, **_kwargs):
+        return "original"
+
+    return SimpleNamespace(load_expert_banks=original_loader, ExpertBanks=FakeExpertBanks), original_loader
 
 
 def test_experimental_converter_patches_only_for_bounded_canonical_call():
-    import freetoken.moe.expert_banks as expert_banks_mod
-
-    original = expert_banks_mod.load_expert_banks
+    fake_mod, original = _fake_expert_banks_module()
     observed = []
 
     def fake_convert(model_path, out_dir, **kwargs):
-        observed.append((model_path, out_dir, kwargs, expert_banks_mod.load_expert_banks))
-        assert expert_banks_mod.load_expert_banks is CONVERTER._low_memory_load_expert_banks
+        observed.append((model_path, out_dir, kwargs, fake_mod.load_expert_banks))
+        assert fake_mod.load_expert_banks is not original
         return {"ok": True}
 
     result = CONVERTER.convert_checkpoint_low_memory_nvfp4(
@@ -247,20 +267,19 @@ def test_experimental_converter_patches_only_for_bounded_canonical_call():
         shard_limit=4096,
         device="cpu",
         _convert_fn=fake_convert,
+        _expert_banks_mod=fake_mod,
     )
 
     assert result == {"ok": True}
     assert observed[0][2]["moe_backend"] == "offload"
-    assert expert_banks_mod.load_expert_banks is original
+    assert fake_mod.load_expert_banks is original
 
 
 def test_experimental_converter_restores_loader_after_failure():
-    import freetoken.moe.expert_banks as expert_banks_mod
-
-    original = expert_banks_mod.load_expert_banks
+    fake_mod, original = _fake_expert_banks_module()
 
     def fail_convert(*_args, **_kwargs):
-        assert expert_banks_mod.load_expert_banks is CONVERTER._low_memory_load_expert_banks
+        assert fake_mod.load_expert_banks is not original
         raise RuntimeError("synthetic canonical conversion failure")
 
     with pytest.raises(RuntimeError, match="synthetic canonical conversion failure"):
@@ -271,6 +290,7 @@ def test_experimental_converter_restores_loader_after_failure():
             shard_limit=4096,
             device="cpu",
             _convert_fn=fail_convert,
+            _expert_banks_mod=fake_mod,
         )
 
-    assert expert_banks_mod.load_expert_banks is original
+    assert fake_mod.load_expert_banks is original
