@@ -12,6 +12,7 @@ on:
       - "python/freetoken/experimental/**"
       - "tests/models/test_nvfp4_low_memory_stream.py"
       - "tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py"
+      - "tests/checkpoint/test_low_memory_nvfp4_ftw_roundtrip.py"
       - "tests/checkpoint/test_mapped_ftw_core_stdlib.py"
       - "tests/checkpoint/test_mapped_ftw_reclaim_stdlib.py"
       - "tests/checkpoint/test_mapped_ftw.py"
@@ -48,6 +49,7 @@ jobs:
             python/freetoken/experimental/file_backed_ftw_cpu_server.py \
             tests/models/test_nvfp4_low_memory_stream.py \
             tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py \
+            tests/checkpoint/test_low_memory_nvfp4_ftw_roundtrip.py \
             tests/checkpoint/test_mapped_ftw_core_stdlib.py \
             tests/checkpoint/test_mapped_ftw_reclaim_stdlib.py \
             tests/checkpoint/test_mapped_ftw.py \
@@ -55,6 +57,7 @@ jobs:
           pytest -q \
             tests/models/test_nvfp4_low_memory_stream.py \
             tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py \
+            tests/checkpoint/test_low_memory_nvfp4_ftw_roundtrip.py \
             tests/checkpoint/test_mapped_ftw_core_stdlib.py \
             tests/checkpoint/test_mapped_ftw_reclaim_stdlib.py \
             tests/checkpoint/test_mapped_ftw.py \
