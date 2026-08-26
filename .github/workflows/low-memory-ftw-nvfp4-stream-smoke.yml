@@ -7,8 +7,17 @@ on:
     paths:
       - "python/freetoken/checkpoint/low_memory_nvfp4.py"
       - "python/freetoken/checkpoint/ftw_filebacked.py"
+      - "python/freetoken/checkpoint/mapped_ftw_core.py"
+      - "python/freetoken/checkpoint/mapped_ftw.py"
+      - "python/freetoken/checkpoint/file_backed_ftw_cpu.py"
+      - "python/freetoken/experimental/file_backed_ftw_cpu_server.py"
       - "tests/models/test_nvfp4_low_memory_stream.py"
       - "tests/models/test_ftw_filebacked.py"
+      - "tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py"
+      - "tests/checkpoint/test_mapped_ftw_core_stdlib.py"
+      - "tests/checkpoint/test_mapped_ftw_reclaim_stdlib.py"
+      - "tests/checkpoint/test_mapped_ftw.py"
+      - "tests/checkpoint/test_file_backed_ftw_cpu_server.py"
       - ".github/workflows/low-memory-ftw-nvfp4-stream-smoke.yml"
 
 permissions:
@@ -31,11 +40,27 @@ jobs:
         run: |
           python -m pip install --disable-pip-version-check --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
           python -m pip install --disable-pip-version-check 'numpy>=2,<3' 'safetensors>=0.6,<1' 'pytest>=8,<9'
-      - name: Run affected synthetic tests
+      - name: Run converged synthetic tests
         run: |
           python -m py_compile \
             python/freetoken/checkpoint/low_memory_nvfp4.py \
             python/freetoken/checkpoint/ftw_filebacked.py \
+            python/freetoken/checkpoint/mapped_ftw_core.py \
+            python/freetoken/checkpoint/mapped_ftw.py \
+            python/freetoken/checkpoint/file_backed_ftw_cpu.py \
+            python/freetoken/experimental/file_backed_ftw_cpu_server.py \
             tests/models/test_nvfp4_low_memory_stream.py \
-            tests/models/test_ftw_filebacked.py
-          pytest -q tests/models/test_nvfp4_low_memory_stream.py tests/models/test_ftw_filebacked.py
+            tests/models/test_ftw_filebacked.py \
+            tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py \
+            tests/checkpoint/test_mapped_ftw_core_stdlib.py \
+            tests/checkpoint/test_mapped_ftw_reclaim_stdlib.py \
+            tests/checkpoint/test_mapped_ftw.py \
+            tests/checkpoint/test_file_backed_ftw_cpu_server.py
+          pytest -q \
+            tests/models/test_nvfp4_low_memory_stream.py \
+            tests/models/test_ftw_filebacked.py \
+            tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py \
+            tests/checkpoint/test_mapped_ftw_core_stdlib.py \
+            tests/checkpoint/test_mapped_ftw_reclaim_stdlib.py \
+            tests/checkpoint/test_mapped_ftw.py \
+            tests/checkpoint/test_file_backed_ftw_cpu_server.py
