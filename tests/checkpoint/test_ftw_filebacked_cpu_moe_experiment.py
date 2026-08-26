@@ -15,32 +15,40 @@ from freetoken.experimental.ftw_filebacked_cpu_moe_server import _requires_all_c
 from freetoken.moe.host_banks import HostResidency
 
 
-BANKS = (
-    "gate_up_packed",
-    "gate_up_scale",
-    "gate_up_global",
-    "down_packed",
-    "down_scale",
-    "down_global",
-)
+BANK_SPECS = {
+    "gate_up_packed": ((2, 32, 8), torch.uint8),
+    "gate_up_scale": ((2, 32, 1), torch.uint8),
+    "gate_up_global": ((2, 32), torch.float16),
+    "down_packed": ((2, 16, 8), torch.uint8),
+    "down_scale": ((2, 16, 1), torch.uint8),
+    "down_global": ((2, 16), torch.float16),
+}
+BANKS = tuple(BANK_SPECS)
 
 
-def _write_native_ftw(path: Path, *, flat: bool = False) -> dict:
+def _tensor(shape: tuple[int, ...], dtype: torch.dtype, value: int) -> torch.Tensor:
+    return torch.full(shape, value, dtype=dtype)
+
+
+def _write_native_ftw(
+    path: Path,
+    *,
+    flat: bool = False,
+    bad_global_dtype: bool = False,
+) -> dict:
     writer = FTWWriter(str(path), shard_limit=4096 * 8)
     expected = {}
-    for bank_id, name in enumerate(BANKS):
+    for bank_id, (name, (shape, dtype)) in enumerate(BANK_SPECS.items()):
+        if bad_global_dtype and name == "gate_up_global":
+            dtype = torch.float32
         if flat:
-            tensor = torch.arange(16, dtype=torch.uint8).view(4, 4) + bank_id
+            layer0 = _tensor(shape, dtype, bank_id + 1)
+            layer1 = _tensor(shape, dtype, bank_id + 9)
+            tensor = torch.cat((layer0, layer1), dim=0)
             writer.add_tensor(name, tensor, kind="experts_bank")
-            expected[(name, 0)] = tensor[:2].clone()
-            expected[(name, 1)] = tensor[2:].clone()
         else:
             for layer in range(2):
-                tensor = (
-                    torch.arange(8, dtype=torch.uint8).view(2, 4)
-                    + bank_id * 16
-                    + layer * 8
-                )
+                tensor = _tensor(shape, dtype, bank_id + layer + 1)
                 writer.add_tensor(
                     layer_bank_entry_name(name, layer),
                     tensor,
@@ -69,7 +77,7 @@ def _entry_file_offset(path: Path, entry_name: str) -> tuple[Path, int]:
     raise AssertionError("entry not contained in one shard")
 
 
-def test_filebacked_native_nvfp4_maps_without_anonymous_bank_copy(tmp_path: Path):
+def test_filebacked_native_nvfp4_maps_cpu_executor_geometry(tmp_path: Path):
     fixture = _write_native_ftw(tmp_path)
     banks = load_ftw_banks_filebacked_cpu(
         str(tmp_path),
@@ -84,10 +92,11 @@ def test_filebacked_native_nvfp4_maps_without_anonymous_bank_copy(tmp_path: Path
     assert banks.file_backed_bytes > 0
     assert banks.mapped_shards > 0
 
-    for name in BANKS:
+    for name, (shape, dtype) in BANK_SPECS.items():
         for layer, tensor in enumerate(banks.sources[name]):
             assert tensor.is_contiguous()
-            assert tensor.shape == (2, 4)
+            assert tensor.shape == shape
+            assert tensor.dtype == dtype
             assert torch.equal(tensor, fixture["expected"][(name, layer)])
 
 
@@ -103,9 +112,9 @@ def test_filebacked_mapping_is_private_cow_and_outlives_result_wrapper(tmp_path:
         layer_residency=[HostResidency.PAGEABLE.value] * 2,
     )
     tensor = banks.sources["gate_up_packed"][0]
-    original = int(tensor[0, 0])
-    tensor[0, 0] = (original + 1) % 255
-    assert int(tensor[0, 0]) != original
+    original = int(tensor[0, 0, 0])
+    tensor[0, 0, 0] = (original + 1) % 255
+    assert int(tensor[0, 0, 0]) != original
 
     # ACCESS_COPY/MAP_PRIVATE must never mutate the checkpoint.
     after = shard.read_bytes()[offset]
@@ -116,7 +125,7 @@ def test_filebacked_mapping_is_private_cow_and_outlives_result_wrapper(tmp_path:
     # process lifetime.
     del banks
     gc.collect()
-    assert int(tensor[0, 0]) != original
+    assert int(tensor[0, 0, 0]) != original
 
 
 def test_filebacked_loader_rejects_any_pinned_layer(tmp_path: Path):
@@ -135,6 +144,16 @@ def test_filebacked_loader_rejects_any_pinned_layer(tmp_path: Path):
 def test_filebacked_loader_rejects_legacy_flat_entries(tmp_path: Path):
     _write_native_ftw(tmp_path, flat=True)
     with pytest.raises(ValueError, match="per-layer"):
+        load_ftw_banks_filebacked_cpu(
+            str(tmp_path),
+            num_layers=2,
+            layer_residency=[HostResidency.PAGEABLE.value] * 2,
+        )
+
+
+def test_filebacked_loader_validates_cpu_executor_nvfp4_dtypes(tmp_path: Path):
+    _write_native_ftw(tmp_path, bad_global_dtype=True)
+    with pytest.raises(ValueError, match="global banks must be float16"):
         load_ftw_banks_filebacked_cpu(
             str(tmp_path),
             num_layers=2,

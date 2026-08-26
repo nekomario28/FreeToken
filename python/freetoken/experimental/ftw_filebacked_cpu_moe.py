@@ -162,6 +162,51 @@ def _tensor_from_mapping(mm: mmap.mmap, entry: dict[str, Any], file_off: int) ->
     return tensor.view(*shape) if shape else tensor.view(())
 
 
+def _validate_native_nvfp4_schema(sources: dict[str, list[torch.Tensor]]) -> tuple[int, int, int]:
+    """Fail before C++ sees raw pointers if the mapped native-NVFP4 geometry is invalid."""
+
+    gup = sources["gate_up_packed"][0]
+    gus = sources["gate_up_scale"][0]
+    gug = sources["gate_up_global"][0]
+    dnp = sources["down_packed"][0]
+    dns = sources["down_scale"][0]
+    dng = sources["down_global"][0]
+
+    if gup.dtype != torch.uint8 or dnp.dtype != torch.uint8:
+        raise ValueError(f"nvfp4 packed banks must be uint8, got {gup.dtype}/{dnp.dtype}")
+    if gus.element_size() != 1 or dns.element_size() != 1:
+        raise ValueError("nvfp4 block-scale banks must use one-byte elements")
+    if gug.dtype != torch.float16 or dng.dtype != torch.float16:
+        raise ValueError(f"nvfp4 global banks must be float16, got {gug.dtype}/{dng.dtype}")
+    if gup.ndim != 3:
+        raise ValueError(f"gate_up_packed must be rank 3, got shape {tuple(gup.shape)}")
+
+    experts = int(gup.shape[0])
+    inter = int(gup.shape[1] // 2)
+    hidden = int(gup.shape[2] * 2)
+    if experts <= 0 or gup.shape[1] != 2 * inter or hidden % 16 or inter % 16:
+        raise ValueError(
+            f"invalid native nvfp4 dimensions experts={experts} hidden={hidden} inter={inter}"
+        )
+
+    expected = {
+        "gate_up_packed": (experts, 2 * inter, hidden // 2),
+        "gate_up_scale": (experts, 2 * inter, hidden // 16),
+        "gate_up_global": (experts, 2 * inter),
+        "down_packed": (experts, hidden, inter // 2),
+        "down_scale": (experts, hidden, inter // 16),
+        "down_global": (experts, hidden),
+    }
+    for name, shape in expected.items():
+        for layer, tensor in enumerate(sources[name]):
+            if tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"nvfp4 bank {name!r} layer {layer} has shape {tuple(tensor.shape)}, "
+                    f"expected {shape}"
+                )
+    return experts, hidden, inter
+
+
 def load_ftw_banks_filebacked_cpu(
     path: str,
     *,
@@ -283,6 +328,7 @@ def load_ftw_banks_filebacked_cpu(
                 pass
         raise
 
+    _validate_native_nvfp4_schema(sources)
     _LIVE_FILE_MAPPINGS.extend(mapping_refs)
     return FileBackedExpertBanks(
         quant_format="nvfp4",
