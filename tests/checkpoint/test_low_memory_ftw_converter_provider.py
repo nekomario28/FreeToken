@@ -95,7 +95,7 @@ def test_provider_fails_closed_outside_converter_contract():
         loader(**common)
     with pytest.raises(ValueError, match="does not support dummy"):
         loader(**common, dummy=True, layer_sink=object())
-    with pytest.raises(ValueError, match="owns serial one-layer"):
+    with pytest.raises(ValueError, match="owns serial fragment source scheduling"):
         loader(**common, parallel=True, layer_sink=object())
     with pytest.raises(ValueError, match="does not accept a serving residency plan"):
         loader(**common, layer_sink=object(), layer_residency=["pageable"])
@@ -117,8 +117,6 @@ def test_bounded_patch_is_owner_thread_scoped_and_restores_after_success():
     fake_mod, original, calls = _fake_expert_banks_module()
 
     with CONVERTER._patched_expert_loader(fake_mod) as replacement:
-        # The owner thread is routed through the replacement. Supply a deliberately invalid
-        # call so it fails inside replacement instead of accidentally reaching original.
         with pytest.raises(ValueError, match="requires the canonical converter layer sink"):
             fake_mod.load_expert_banks(
                 "/synthetic/model",
