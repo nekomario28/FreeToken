@@ -8,7 +8,11 @@ contract:
 * CLI defaults to read-only preflight; ``--execute`` is explicit;
 * preflight reads local ``config.json`` plus safetensors headers with stdlib only -- no
   FreeToken model/runtime import is needed before admission;
-* execution re-parses the runtime config after admission and cross-checks dimensions;
+* a Qwen3.5 mixed-precision dense anonymous-allocation envelope is derived from metadata;
+  file-backed source tensors are not charged as anonymous RAM;
+* dense and expert phases are sequential, so admission charges their maximum rather than
+  summing both peaks;
+* execution re-parses the runtime config and re-checks MemAvailable after torch/model imports;
 * canonical conversion writes into a hidden sibling staging directory;
 * the resulting canonical FTW index is validated as native NVFP4 with all expected layers;
 * a machine-readable receipt is fsynced before publication;
@@ -31,7 +35,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from .ftw_resource_gate import preflight_low_memory_nvfp4_conversion
+from .dense_conversion_envelope import estimate_qwen35_mixed_dense_anonymous_peak
+from .ftw_resource_gate import (
+    load_safetensors_headers,
+    preflight_low_memory_nvfp4_conversion,
+    require_current_memory,
+)
 
 _DEFAULT_SHARD_LIMIT = 8 << 30
 _SUPPORTED_ARCH = "Qwen3_5MoeForConditionalGeneration"
@@ -76,7 +85,6 @@ def _routed_expert_quant_from_hf(hf_config: Any) -> str:
 
 
 def _preflight_config_from_hf(hf_config: Any):
-    """Extract only fields required by the resource gate; do not import model/runtime code."""
     architectures = _architectures_from_hf(hf_config)
     if _SUPPORTED_ARCH not in architectures:
         raise ValueError(
@@ -108,8 +116,7 @@ def _preflight_config_from_hf(hf_config: Any):
     )
 
 
-def _resolve_qwen35_preflight_config(model_path: str):
-    """Read local config.json directly; resource preflight is intentionally runtime-free."""
+def _load_local_config_json(model_path: str) -> dict[str, Any]:
     root = Path(model_path).expanduser().resolve()
     if not root.is_dir():
         raise ValueError("preflight requires an existing local checkpoint directory")
@@ -122,7 +129,26 @@ def _resolve_qwen35_preflight_config(model_path: str):
         raise ValueError(f"checkpoint config.json is unreadable: {exc}") from exc
     if not isinstance(config, dict):
         raise ValueError("checkpoint config.json must contain a JSON object")
-    return _preflight_config_from_hf(config)
+    return config
+
+
+def _resolve_qwen35_preflight_config(model_path: str):
+    return _preflight_config_from_hf(_load_local_config_json(model_path))
+
+
+def _resource_plan(model_path: str, out_dir: str):
+    """Build the complete payload-free Qwen3.5 mixed-precision admission plan."""
+    raw_config = _load_local_config_json(model_path)
+    preflight_config = _preflight_config_from_hf(raw_config)
+    headers = load_safetensors_headers(model_path)
+    dense_envelope = estimate_qwen35_mixed_dense_anonymous_peak(raw_config, headers)
+    report = preflight_low_memory_nvfp4_conversion(
+        model_path,
+        out_dir,
+        preflight_config,
+        dense_anonymous_peak_bytes=int(dense_envelope["anonymous_peak_bytes"]),
+    )
+    return preflight_config, dense_envelope, report
 
 
 def _resolve_qwen35_runtime_config(model_path: str, preflight_config: Any):
@@ -189,7 +215,6 @@ def _write_receipt(staging: Path, receipt: dict[str, Any]) -> None:
 
 
 def _rename_noreplace(source: Path, destination: Path) -> None:
-    """Atomically publish a directory without ever replacing an existing destination."""
     libc = ctypes.CDLL(None, use_errno=True)
     renameat2 = getattr(libc, "renameat2", None)
     if renameat2 is None:
@@ -226,8 +251,9 @@ def _atomic_staged_canonical_conversion(
     convert_fn: Callable[..., dict],
     shard_limit: int,
     device: str,
+    dense_envelope: dict[str, Any] | None = None,
+    runtime_mem_available_bytes: int | None = None,
 ) -> tuple[dict, dict[str, Any]]:
-    """Run an admitted canonical conversion in a sibling staging dir, then publish it."""
     output = Path(out_dir)
     if output.exists():
         raise ValueError(
@@ -254,6 +280,8 @@ def _atomic_staged_canonical_conversion(
             "out_dir": os.path.abspath(out_dir),
             "device": device,
             "resources": preflight_report.as_dict(),
+            "runtime_mem_available_bytes": runtime_mem_available_bytes,
+            "dense_envelope": dense_envelope,
             "counts": index.get("counts"),
             "fingerprint": index.get("fingerprint"),
             "quant_format": index.get("quant_format"),
@@ -269,9 +297,8 @@ def _atomic_staged_canonical_conversion(
 
 
 def preflight_qwen35_native_nvfp4(model_path: str, out_dir: str) -> dict[str, Any]:
-    """Read-only admission report. Never creates the output directory."""
-    model_config = _resolve_qwen35_preflight_config(model_path)
-    report = preflight_low_memory_nvfp4_conversion(model_path, out_dir, model_config)
+    """Payload-free read-only admission report. Never creates the output directory."""
+    _config, dense_envelope, report = _resource_plan(model_path, out_dir)
     return {
         "mode": "preflight",
         "architecture": _SUPPORTED_ARCH,
@@ -279,6 +306,7 @@ def preflight_qwen35_native_nvfp4(model_path: str, out_dir: str) -> dict[str, An
         "model_path": os.path.abspath(model_path),
         "out_dir": os.path.abspath(out_dir),
         "resources": report.as_dict(),
+        "dense_envelope": dense_envelope,
     }
 
 
@@ -290,15 +318,16 @@ def execute_qwen35_native_nvfp4(
     device: str = "cuda:0",
 ) -> dict[str, Any]:
     """Run the admitted experiment. This is never the CLI default."""
-    preflight_config = _resolve_qwen35_preflight_config(model_path)
-    report = preflight_low_memory_nvfp4_conversion(model_path, out_dir, preflight_config)
+    preflight_config, dense_envelope, report = _resource_plan(model_path, out_dir)
     if Path(out_dir).exists():
         raise ValueError("--execute requires --out to not exist; choose a fresh output path")
 
-    # Heavy/runtime imports start only after admission.
+    # Heavy/runtime imports start only after metadata admission. Then re-check memory so the
+    # actual torch/model runtime footprint is already reflected in MemAvailable.
     import torch
 
     runtime_config = _resolve_qwen35_runtime_config(model_path, preflight_config)
+    runtime_mem_available = require_current_memory(report)
     from .low_memory_ftw_converter import convert_checkpoint_low_memory_nvfp4
 
     def _convert(model: str, staging: str, *, shard_limit: int, device: str):
@@ -319,6 +348,8 @@ def execute_qwen35_native_nvfp4(
         convert_fn=_convert,
         shard_limit=shard_limit,
         device=device,
+        dense_envelope=dense_envelope,
+        runtime_mem_available_bytes=runtime_mem_available,
     )
     return {
         "mode": "executed",
@@ -327,6 +358,8 @@ def execute_qwen35_native_nvfp4(
         "model_path": os.path.abspath(model_path),
         "out_dir": os.path.abspath(out_dir),
         "resources": report.as_dict(),
+        "runtime_mem_available_bytes": runtime_mem_available,
+        "dense_envelope": dense_envelope,
         "counts": index.get("counts"),
         "fingerprint": index.get("fingerprint"),
         "receipt": os.path.join(os.path.abspath(out_dir), _RECEIPT_NAME),

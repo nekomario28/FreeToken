@@ -1,21 +1,22 @@
 """Read-only resource admission for the low-memory native-NVFP4 -> FTW experiment.
 
-The real conversion can be tens of GiB and may expand some packed tensors while fusing or
-converting them. This module performs a deliberately conservative preflight before any FTW
-shard is created. It reads only the safetensors index/header metadata plus OS free-space /
-MemAvailable counters; no weight payload is materialized.
+This gate separates memory by *residency semantics* instead of treating every source byte as
+anonymous RAM:
 
-The estimates are guards, not performance predictions:
+* safetensors CPU tensors are file-backed/lazy views and their page-cache pressure is
+  reclaimable; source payload size is reported but is not automatically charged as
+  anonymous memory;
+* dense conversion may allocate real anonymous transform outputs (fusion, dequant, etc.);
+  callers that can derive an exact metadata-only envelope pass it via
+  ``dense_anonymous_peak_bytes``;
+* routed experts are processed in a separate phase, so dense peak and expert peak are not
+  summed -- the conversion phase peak is their maximum;
+* a modest execution margin remains, and execution re-checks MemAvailable *after* importing
+  torch/model runtime so unknown runtime overhead is observed rather than guessed as a large
+  fixed preflight reserve.
 
-* disk guard = 4x all source tensor payload bytes + one FTW alignment page per source tensor
-  + 2 GiB fixed headroom. 4x covers the worst common packed-NVFP4 uint8 -> bf16 expansion.
-* RAM guard = exact six-bank native-NVFP4 bytes for ONE MoE layer + 8x the largest raw source
-  tensor + 2 GiB fixed headroom. The 8x term covers multi-part dense fusion/dequant
-  transients without pretending to be an exact allocator model.
-
-Failing a guard means "do not start the real conversion". Passing means only that these
-coarse resource floors are satisfied; runtime correctness still belongs to the synthetic /
-ROCm integration gates and the converter itself.
+The legacy conservative RAM formula remains only as a fail-closed fallback for callers that
+do not provide a structural dense envelope.
 """
 from __future__ import annotations
 
@@ -29,8 +30,12 @@ from typing import Any
 
 ALIGN = 4096
 DISK_EXPANSION_FACTOR = 4
-DENSE_TRANSIENT_FACTOR = 8
-FIXED_HEADROOM_BYTES = 2 << 30
+DENSE_TRANSIENT_FACTOR = 8  # legacy fallback only
+DISK_FIXED_HEADROOM_BYTES = 2 << 30
+RUNTIME_MARGIN_BYTES = 512 << 20
+# Backward-compatible name used by older experimental tests/callers. It is disk headroom;
+# exact-envelope RAM admission no longer adds 2 GiB blindly.
+FIXED_HEADROOM_BYTES = DISK_FIXED_HEADROOM_BYTES
 INDEX_NAME = "model.safetensors.index.json"
 
 
@@ -42,12 +47,16 @@ class ConversionPreflight:
     source_tensor_count: int
     largest_source_tensor_bytes: int
     expert_layer_bytes: int
+    dense_anonymous_peak_bytes: int
+    phase_anonymous_peak_bytes: int
+    runtime_margin_bytes: int
     output_guard_bytes: int
     disk_free_bytes: int
     ram_guard_bytes: int
     mem_available_bytes: int
+    ram_model: str
 
-    def as_dict(self) -> dict[str, int]:
+    def as_dict(self) -> dict[str, Any]:
         return asdict(self)
 
 
@@ -96,7 +105,6 @@ def _existing_probe_dir(path: Path) -> Path:
 
 
 def _validate_source_output_separation(source: Path, output: Path) -> None:
-    """Never write the conversion product into the source checkpoint tree."""
     source_root = source.expanduser().resolve()
     output_root = output.expanduser().resolve()
     if output_root == source_root or source_root in output_root.parents:
@@ -142,42 +150,72 @@ def _source_shards(model_path: Path) -> list[Path]:
     return shards
 
 
+def _read_safetensors_header(shard: Path) -> tuple[dict[str, Any], int]:
+    file_size = shard.stat().st_size
+    with shard.open("rb") as handle:
+        raw = handle.read(8)
+        if len(raw) != 8:
+            raise ValueError(f"truncated safetensors header length: {shard.name}")
+        header_len = struct.unpack("<Q", raw)[0]
+        if header_len <= 0 or 8 + header_len > file_size:
+            raise ValueError(f"invalid safetensors header length in {shard.name}")
+        try:
+            header = json.loads(handle.read(header_len))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(f"invalid safetensors JSON header in {shard.name}") from exc
+    if not isinstance(header, dict):
+        raise ValueError(f"safetensors header is not an object: {shard.name}")
+    data_region = file_size - (8 + header_len)
+    return header, data_region
+
+
+def _validated_tensor_meta(name: str, meta: Any, shard: Path, data_region: int) -> int:
+    if not isinstance(meta, dict):
+        raise ValueError(f"invalid tensor metadata for {name!r} in {shard.name}")
+    offsets = meta.get("data_offsets")
+    if (
+        not isinstance(offsets, list)
+        or len(offsets) != 2
+        or any(isinstance(x, bool) or not isinstance(x, int) for x in offsets)
+    ):
+        raise ValueError(f"invalid data_offsets for {name!r} in {shard.name}")
+    begin, end = offsets
+    if begin < 0 or end < begin or end > data_region:
+        raise ValueError(f"out-of-range data_offsets for {name!r} in {shard.name}")
+    return end - begin
+
+
+def load_safetensors_headers(model_path: str | os.PathLike[str]) -> dict[str, dict[str, Any]]:
+    """Return merged validated tensor headers without touching tensor payload bytes."""
+    merged: dict[str, dict[str, Any]] = {}
+    for shard in _source_shards(Path(model_path)):
+        header, data_region = _read_safetensors_header(shard)
+        for name, meta in header.items():
+            if name == "__metadata__":
+                continue
+            _validated_tensor_meta(name, meta, shard, data_region)
+            if name in merged:
+                raise ValueError(f"duplicate safetensors tensor name across shards: {name}")
+            merged[name] = meta
+    if not merged:
+        raise ValueError("checkpoint contains no safetensors tensors")
+    return merged
+
+
 def _safetensors_header_stats(shards: list[Path]) -> tuple[int, int, int]:
     total = 0
     count = 0
     largest = 0
+    names: set[str] = set()
     for shard in shards:
-        file_size = shard.stat().st_size
-        with shard.open("rb") as handle:
-            raw = handle.read(8)
-            if len(raw) != 8:
-                raise ValueError(f"truncated safetensors header length: {shard.name}")
-            header_len = struct.unpack("<Q", raw)[0]
-            if header_len <= 0 or 8 + header_len > file_size:
-                raise ValueError(f"invalid safetensors header length in {shard.name}")
-            try:
-                header = json.loads(handle.read(header_len))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError(f"invalid safetensors JSON header in {shard.name}") from exc
-        if not isinstance(header, dict):
-            raise ValueError(f"safetensors header is not an object: {shard.name}")
-        data_region = file_size - (8 + header_len)
+        header, data_region = _read_safetensors_header(shard)
         for name, meta in header.items():
             if name == "__metadata__":
                 continue
-            if not isinstance(meta, dict):
-                raise ValueError(f"invalid tensor metadata for {name!r} in {shard.name}")
-            offsets = meta.get("data_offsets")
-            if (
-                not isinstance(offsets, list)
-                or len(offsets) != 2
-                or any(isinstance(x, bool) or not isinstance(x, int) for x in offsets)
-            ):
-                raise ValueError(f"invalid data_offsets for {name!r} in {shard.name}")
-            begin, end = offsets
-            if begin < 0 or end < begin or end > data_region:
-                raise ValueError(f"out-of-range data_offsets for {name!r} in {shard.name}")
-            nbytes = end - begin
+            if name in names:
+                raise ValueError(f"duplicate safetensors tensor name across shards: {name}")
+            names.add(name)
+            nbytes = _validated_tensor_meta(name, meta, shard, data_region)
             total += nbytes
             count += 1
             largest = max(largest, nbytes)
@@ -186,11 +224,28 @@ def _safetensors_header_stats(shards: list[Path]) -> tuple[int, int, int]:
     return total, count, largest
 
 
+def require_current_memory(
+    report: ConversionPreflight,
+    *,
+    mem_available_bytes: int | None = None,
+) -> int:
+    """Re-check RAM against the same phase envelope at the *current* runtime state."""
+    available = _mem_available_bytes() if mem_available_bytes is None else int(mem_available_bytes)
+    if available < int(report.ram_guard_bytes):
+        raise RuntimeError(
+            "low-memory FTW conversion blocked after runtime initialization: MemAvailable is "
+            f"{available / 2**30:.2f} GiB, phase envelope + margin requires "
+            f"{report.ram_guard_bytes / 2**30:.2f} GiB"
+        )
+    return available
+
+
 def preflight_low_memory_nvfp4_conversion(
     model_path: str | os.PathLike[str],
     out_dir: str | os.PathLike[str],
     model_config: Any,
     *,
+    dense_anonymous_peak_bytes: int | None = None,
     disk_free_bytes: int | None = None,
     mem_available_bytes: int | None = None,
 ) -> ConversionPreflight:
@@ -207,13 +262,27 @@ def preflight_low_memory_nvfp4_conversion(
     output_guard = (
         DISK_EXPANSION_FACTOR * tensor_bytes
         + ALIGN * tensor_count
-        + FIXED_HEADROOM_BYTES
+        + DISK_FIXED_HEADROOM_BYTES
     )
-    ram_guard = (
-        expert_layer
-        + DENSE_TRANSIENT_FACTOR * largest
-        + FIXED_HEADROOM_BYTES
-    )
+
+    if dense_anonymous_peak_bytes is None:
+        # Generic fail-closed fallback. The Qwen3.5 mixed-precision experimental wrapper
+        # supplies an exact metadata-only envelope and therefore does not use this path.
+        dense_peak = DENSE_TRANSIENT_FACTOR * largest
+        phase_peak = expert_layer + dense_peak
+        runtime_margin = DISK_FIXED_HEADROOM_BYTES
+        ram_model = "legacy_conservative_fallback"
+    else:
+        dense_peak = int(dense_anonymous_peak_bytes)
+        if dense_peak < 0:
+            raise ValueError("dense_anonymous_peak_bytes must be non-negative")
+        # Dense conversion completes before expert-bank conversion begins. Charging both at
+        # once recreates the old overestimate; the anonymous phase peak is their maximum.
+        phase_peak = max(expert_layer, dense_peak)
+        runtime_margin = RUNTIME_MARGIN_BYTES
+        ram_model = "phase_max_exact_dense"
+
+    ram_guard = phase_peak + runtime_margin
     if disk_free_bytes is None:
         disk_free_bytes = shutil.disk_usage(_existing_probe_dir(output)).free
     if mem_available_bytes is None:
@@ -229,7 +298,7 @@ def preflight_low_memory_nvfp4_conversion(
     if mem_available_bytes < ram_guard:
         raise RuntimeError(
             "low-memory FTW conversion blocked: MemAvailable is "
-            f"{mem_available_bytes / 2**30:.2f} GiB, conservative guard requires "
+            f"{mem_available_bytes / 2**30:.2f} GiB, RAM model {ram_model} requires "
             f"{ram_guard / 2**30:.2f} GiB"
         )
     return ConversionPreflight(
@@ -239,10 +308,14 @@ def preflight_low_memory_nvfp4_conversion(
         source_tensor_count=tensor_count,
         largest_source_tensor_bytes=largest,
         expert_layer_bytes=expert_layer,
+        dense_anonymous_peak_bytes=dense_peak,
+        phase_anonymous_peak_bytes=phase_peak,
+        runtime_margin_bytes=runtime_margin,
         output_guard_bytes=output_guard,
         disk_free_bytes=disk_free_bytes,
         ram_guard_bytes=ram_guard,
         mem_available_bytes=mem_available_bytes,
+        ram_model=ram_model,
     )
 
 
@@ -251,7 +324,11 @@ __all__ = [
     "ConversionPreflight",
     "DENSE_TRANSIENT_FACTOR",
     "DISK_EXPANSION_FACTOR",
+    "DISK_FIXED_HEADROOM_BYTES",
     "FIXED_HEADROOM_BYTES",
+    "RUNTIME_MARGIN_BYTES",
+    "load_safetensors_headers",
     "native_nvfp4_expert_layer_bytes",
     "preflight_low_memory_nvfp4_conversion",
+    "require_current_memory",
 ]
