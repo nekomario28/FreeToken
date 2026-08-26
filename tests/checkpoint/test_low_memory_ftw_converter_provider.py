@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,13 +27,14 @@ def _config():
     return SimpleNamespace(
         architectures=("Qwen3_5MoeForConditionalGeneration",),
         expert_quant="nvfp4",
+        num_moe_layers=2,
     )
 
 
-def _loader_with_fake_stream(calls):
+def _loader_with_fake_stream(calls, *, layers_streamed=2):
     def fake_stream(model_path, model_config, source_spec, layer_sink):
         calls.append((model_path, model_config, source_spec, layer_sink))
-        return {"layers_streamed": 2}
+        return {"layers_streamed": layers_streamed}
 
     return CONVERTER._make_low_memory_loader(
         FakeExpertBanks,
@@ -65,6 +67,20 @@ def test_provider_routes_only_through_one_layer_stream():
     assert all(per_layer == [] for per_layer in banks.sources.values())
 
 
+def test_provider_rejects_incomplete_stream_before_streamed_bundle():
+    calls = []
+    loader = _loader_with_fake_stream(calls, layers_streamed=1)
+    with pytest.raises(RuntimeError, match="incomplete layer set: 1/2"):
+        loader(
+            "/synthetic/model",
+            _config(),
+            device="cuda:0",
+            dtype="bf16",
+            layer_sink=object(),
+        )
+    assert len(calls) == 1
+
+
 def test_provider_fails_closed_outside_converter_contract():
     calls = []
     loader = _loader_with_fake_stream(calls)
@@ -87,14 +103,56 @@ def test_provider_fails_closed_outside_converter_contract():
 
 
 def _fake_expert_banks_module():
-    def original_loader(*_args, **_kwargs):
+    calls = []
+
+    def original_loader(value=None, *_args, **_kwargs):
+        calls.append(("original", value))
         return "original"
 
-    return SimpleNamespace(load_expert_banks=original_loader, ExpertBanks=FakeExpertBanks), original_loader
+    module = SimpleNamespace(load_expert_banks=original_loader, ExpertBanks=FakeExpertBanks)
+    return module, original_loader, calls
 
 
-def test_bounded_patch_restores_provider_after_success():
-    fake_mod, original = _fake_expert_banks_module()
+def test_bounded_patch_is_owner_thread_scoped_and_restores_after_success():
+    fake_mod, original, calls = _fake_expert_banks_module()
+
+    with CONVERTER._patched_expert_loader(fake_mod) as replacement:
+        # The owner thread is routed through the replacement. Supply a deliberately invalid
+        # call so it fails inside replacement instead of accidentally reaching original.
+        with pytest.raises(ValueError, match="requires the canonical converter layer sink"):
+            fake_mod.load_expert_banks(
+                "/synthetic/model",
+                _config(),
+                device="cuda:0",
+                dtype="bf16",
+            )
+
+        other_result = []
+        thread = threading.Thread(
+            target=lambda: other_result.append(fake_mod.load_expert_banks("other-thread"))
+        )
+        thread.start()
+        thread.join()
+        assert other_result == ["original"]
+        assert replacement is not original
+
+    assert fake_mod.load_expert_banks is original
+    assert calls == [("original", "other-thread")]
+
+
+def test_bounded_patch_restores_provider_after_failure():
+    fake_mod, original, _calls = _fake_expert_banks_module()
+
+    with pytest.raises(RuntimeError, match="synthetic context failure"):
+        with CONVERTER._patched_expert_loader(fake_mod):
+            assert fake_mod.load_expert_banks is not original
+            raise RuntimeError("synthetic context failure")
+
+    assert fake_mod.load_expert_banks is original
+
+
+def test_canonical_call_uses_patch_only_for_bounded_call_and_restores():
+    fake_mod, original, _calls = _fake_expert_banks_module()
     observed = []
 
     def fake_convert(model_path, out_dir, **kwargs):
@@ -117,8 +175,8 @@ def test_bounded_patch_restores_provider_after_success():
     assert fake_mod.load_expert_banks is original
 
 
-def test_bounded_patch_restores_provider_after_failure():
-    fake_mod, original = _fake_expert_banks_module()
+def test_canonical_call_restores_provider_after_failure():
+    fake_mod, original, _calls = _fake_expert_banks_module()
 
     def fail_convert(*_args, **_kwargs):
         assert fake_mod.load_expert_banks is not original
@@ -139,7 +197,7 @@ def test_bounded_patch_restores_provider_after_failure():
 
 
 def test_non_offload_backend_is_rejected_before_patch():
-    fake_mod, original = _fake_expert_banks_module()
+    fake_mod, original, _calls = _fake_expert_banks_module()
     with pytest.raises(ValueError, match="requires moe_backend='offload'"):
         CONVERTER.convert_checkpoint_low_memory_nvfp4(
             "/synthetic/model",

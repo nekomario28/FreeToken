@@ -1,24 +1,23 @@
-"""Opt-in low-memory FTW conversion for the file-backed CPU MoE experiment.
+"""Converter-only native-NVFP4 provider for the low-memory FTW experiment.
 
-The canonical ``ft checkpoint`` path is intentionally unchanged. This wrapper runs the
-canonical :func:`freetoken.checkpoint.convert.convert_checkpoint` while temporarily replacing
-only its expert-bank provider with the already-tested one-MoE-layer-at-a-time NVFP4 streamer.
-Dense conversion, metadata copying, FTW writing/finalization, and source fingerprinting remain
-owned by the canonical converter.
+The canonical ``ft checkpoint`` path is not modified. This module supplies a bounded adapter
+with the same call shape as ``freetoken.moe.expert_banks.load_expert_banks`` and installs it
+only for one canonical conversion call. The dispatcher is owner-thread scoped: unrelated
+threads continue to use the original loader while the experiment runs.
 
-The experiment is deliberately narrow and fail-closed:
+The path is deliberately narrow and fail-closed:
 
 * Qwen3.5 ModelOpt NVFP4 MoE only;
-* offload conversion with a layer sink only;
-* no dummy banks, no caller-supplied residency plan, no serving fallback;
-* native ``nvfp4`` FTW banks, intended for the separate file-backed CPU-only server experiment.
-
-This module does not authorize a real checkpoint conversion. External architecture/resource
-admission must pass before real weight payloads are read.
+* canonical converter ``layer_sink`` required;
+* no dummy banks or serving residency plan;
+* strict one-layer serial expert scheduling;
+* native ``nvfp4`` bundle only;
+* complete streamed layer count required before a streamed bundle is returned.
 """
 from __future__ import annotations
 
 import importlib
+import threading
 from contextlib import contextmanager
 from typing import Any, Callable, Iterator
 
@@ -31,6 +30,7 @@ _NATIVE_NVFP4_BANKS = (
     "down_global",
 )
 _SUPPORTED_ARCH = "Qwen3_5MoeForConditionalGeneration"
+_EXPERT_LOADER_PATCH_LOCK = threading.RLock()
 
 
 def _source_spec_for_model(model_config):
@@ -67,11 +67,7 @@ def _make_low_memory_loader(
     source_spec_for_model: Callable[[Any], Any] = _source_spec_for_model,
     stream_one_layer: Callable[[str, Any, Any, Any], dict] = _stream_one_layer_at_a_time,
 ):
-    """Build the canonical ``load_expert_banks``-shape converter adapter.
-
-    Dependency injection keeps the contract testable with the workflow's minimal CPU
-    dependency set; production supplies the real ``ExpertBanks`` class and lazy source helpers.
-    """
+    """Build the canonical ``load_expert_banks``-shape converter adapter."""
 
     def load_expert_banks(
         model_path,
@@ -98,7 +94,14 @@ def _make_low_memory_loader(
             raise ValueError("low-memory FTW conversion owns serial one-layer source scheduling")
 
         source_spec = source_spec_for_model(model_config)
-        stream_one_layer(model_path, model_config, source_spec, layer_sink)
+        stats = stream_one_layer(model_path, model_config, source_spec, layer_sink)
+        expected_layers = int(model_config.num_moe_layers)
+        actual_layers = int((stats or {}).get("layers_streamed", -1))
+        if actual_layers != expected_layers:
+            raise RuntimeError(
+                "low-memory NVFP4 streamer produced an incomplete layer set: "
+                f"{actual_layers}/{expected_layers}"
+            )
         return expert_banks_cls(
             "nvfp4",
             {name: [] for name in _NATIVE_NVFP4_BANKS},
@@ -110,17 +113,31 @@ def _make_low_memory_loader(
 
 @contextmanager
 def _patched_expert_loader(expert_banks_mod=None) -> Iterator[Callable[..., Any]]:
-    """Install the converter-only provider for one bounded call and always restore it."""
+    """Install an owner-thread-scoped converter provider and always restore the original.
+
+    ``convert_checkpoint`` imports ``load_expert_banks`` at call time. A plain global
+    monkeypatch could therefore hijack unrelated serving/conversion work in another thread.
+    This dispatcher routes only the thread that entered the context to the experimental
+    loader; all other threads keep using the original. Contexts are serialized so dispatchers
+    cannot stack over each other.
+    """
     if expert_banks_mod is None:
         import freetoken.moe.expert_banks as expert_banks_mod
 
-    original = expert_banks_mod.load_expert_banks
-    replacement = _make_low_memory_loader(expert_banks_mod.ExpertBanks)
-    expert_banks_mod.load_expert_banks = replacement
-    try:
-        yield replacement
-    finally:
-        expert_banks_mod.load_expert_banks = original
+    with _EXPERT_LOADER_PATCH_LOCK:
+        original = expert_banks_mod.load_expert_banks
+        replacement = _make_low_memory_loader(expert_banks_mod.ExpertBanks)
+        owner_thread = threading.get_ident()
+
+        def scoped_loader(*args, **kwargs):
+            target = replacement if threading.get_ident() == owner_thread else original
+            return target(*args, **kwargs)
+
+        expert_banks_mod.load_expert_banks = scoped_loader
+        try:
+            yield replacement
+        finally:
+            expert_banks_mod.load_expert_banks = original
 
 
 def convert_checkpoint_low_memory_nvfp4(
@@ -134,13 +151,7 @@ def convert_checkpoint_low_memory_nvfp4(
     _convert_fn: Callable[..., Any] | None = None,
     _expert_banks_mod=None,
 ):
-    """Run canonical FTW conversion with the bounded one-layer NVFP4 expert provider.
-
-    ``_convert_fn`` and ``_expert_banks_mod`` are internal test seams. Production calls leave
-    both unset and execute the repository's canonical converter against the real provider
-    module. ``moe_backend`` must stay ``offload`` because the output expert-bank layout is the
-    native CPU-MoE ``nvfp4`` ABI.
-    """
+    """Run canonical FTW conversion with the bounded native-NVFP4 expert provider."""
     if moe_backend != "offload":
         raise ValueError("low-memory FTW conversion requires moe_backend='offload'")
 
