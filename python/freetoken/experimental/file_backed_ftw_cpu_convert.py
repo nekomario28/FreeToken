@@ -112,6 +112,37 @@ def _temporary_expert_loader(module: Any, loader: Callable[..., Any]):
         module.load_expert_banks = original
 
 
+def _require_metadata_preflight(
+    model_path: str,
+    out_dir: str,
+    *,
+    preflight_fn: Callable[[str, str], dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Fail before tensor payload access when the metadata-only preflight blocks.
+
+    A successful preflight is deliberately not a resource authorization; it only proves
+    that the local checkpoint metadata/layout is eligible for this experimental path.
+    """
+    if preflight_fn is None:
+        from freetoken.experimental.file_backed_ftw_cpu_preflight import (
+            preflight_file_backed_ftw_cpu_conversion,
+        )
+
+        preflight_fn = preflight_file_backed_ftw_cpu_conversion
+    result = preflight_fn(model_path, out_dir)
+    if result.get("admission") == "BLOCK":
+        blockers = result.get("blockers") or ["unspecified metadata preflight blocker"]
+        raise ValueError(
+            "file-backed FTW CPU conversion preflight blocked: " + "; ".join(map(str, blockers))
+        )
+    if result.get("admission") != "METADATA_OK_RESOURCE_UNPROVEN":
+        raise ValueError(
+            "file-backed FTW CPU conversion preflight returned unexpected admission: "
+            f"{result.get('admission')!r}"
+        )
+    return result
+
+
 def convert_file_backed_ftw_cpu(
     model_path: str,
     out_dir: str,
@@ -126,6 +157,8 @@ def convert_file_backed_ftw_cpu(
     performed by canonical ``convert_checkpoint``.  Callers are responsible for external
     resource admission before invoking it on a real checkpoint.
     """
+    _require_metadata_preflight(model_path, out_dir)
+
     import torch
     import freetoken.moe.expert_banks as expert_module
     from freetoken.checkpoint.convert import convert_checkpoint
@@ -153,5 +186,6 @@ def convert_file_backed_ftw_cpu(
 __all__ = [
     "convert_file_backed_ftw_cpu",
     "_make_low_memory_native_nvfp4_loader",
+    "_require_metadata_preflight",
     "_temporary_expert_loader",
 ]
