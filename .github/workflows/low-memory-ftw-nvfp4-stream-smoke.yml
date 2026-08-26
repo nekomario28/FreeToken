@@ -6,7 +6,9 @@ on:
       - work/low-memory-ftw-nvfp4-stream-20260826
     paths:
       - "python/freetoken/checkpoint/low_memory_nvfp4.py"
+      - "python/freetoken/checkpoint/ftw_filebacked.py"
       - "tests/models/test_nvfp4_low_memory_stream.py"
+      - "tests/models/test_ftw_filebacked.py"
       - ".github/workflows/low-memory-ftw-nvfp4-stream-smoke.yml"
 
 permissions:
@@ -28,11 +30,12 @@ jobs:
       - name: Install minimal CPU test dependencies
         run: |
           python -m pip install --disable-pip-version-check --index-url https://download.pytorch.org/whl/cpu 'torch==2.10.0'
-          python -m pip install --disable-pip-version-check \
-            'numpy>=2,<2.5' 'safetensors>=0.6,<1' 'pytest>=8,<9' 'huggingface_hub>=1.5,<2'
+          python -m pip install --disable-pip-version-check 'safetensors>=0.6,<1' 'pytest>=8,<9'
       - name: Run affected synthetic tests
-        env:
-          PYTHONPATH: python
         run: |
-          python -m py_compile python/freetoken/checkpoint/low_memory_nvfp4.py tests/models/test_nvfp4_low_memory_stream.py
-          pytest -q tests/models/test_nvfp4_low_memory_stream.py
+          python -m py_compile \
+            python/freetoken/checkpoint/low_memory_nvfp4.py \
+            python/freetoken/checkpoint/ftw_filebacked.py \
+            tests/models/test_nvfp4_low_memory_stream.py \
+            tests/models/test_ftw_filebacked.py
+          pytest -q tests/models/test_nvfp4_low_memory_stream.py tests/models/test_ftw_filebacked.py

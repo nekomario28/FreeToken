@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+import importlib.util
 import json
 import re
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from safetensors.torch import save_file
 
-from freetoken.checkpoint.low_memory_nvfp4 import stream_nvfp4_layers_serial
+
+_MODULE_PATH = Path(__file__).resolve().parents[2] / "python/freetoken/checkpoint/low_memory_nvfp4.py"
+_MODULE_SPEC = importlib.util.spec_from_file_location("freetoken_low_memory_nvfp4_under_test", _MODULE_PATH)
+assert _MODULE_SPEC is not None and _MODULE_SPEC.loader is not None
+_MODULE = importlib.util.module_from_spec(_MODULE_SPEC)
+_MODULE_SPEC.loader.exec_module(_MODULE)
+stream_nvfp4_layers_serial = _MODULE.stream_nvfp4_layers_serial
 
 
 _SPEC = SimpleNamespace(
