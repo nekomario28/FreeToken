@@ -1,8 +1,9 @@
 """PyTorch adapter for reclaimable file-backed FTW expert sources.
 
 Storage ownership and layout validation live in :mod:`mapped_ftw_core`; this module adds
-only dtype/shape tensor views and the existing FreeToken source shape
-``dict[bank_name, list[Tensor]]``.  It does not wire the bundle into the engine yet.
+dtype/shape tensor views, the existing FreeToken source shape
+``dict[bank_name, list[Tensor]]``, and an explicit CPU-only cache-attachment boundary.
+Nothing here changes the default FTW loader or engine path.
 """
 from __future__ import annotations
 
@@ -111,7 +112,7 @@ def map_ftw_expert_sources(
 
     The checkpoint index is parsed once, every non-alpha expert bank must use the converter's
     ``bank#Lxxxxx`` layout, and every layer is labelled PAGEABLE because these mappings are
-    neither pinned nor mlocked.  The bundle retains all mapping owners explicitly.
+    neither pinned nor mlocked. The bundle retains all mapping owners explicitly.
     """
 
     index = load_ftw_index(path)
@@ -153,9 +154,46 @@ def map_ftw_expert_sources(
     )
 
 
+def attach_file_backed_ftw_sources(
+    cache,
+    path: str | os.PathLike[str],
+    *,
+    num_experts: int | None = None,
+) -> MappedFTWExpertSources:
+    """Explicitly attach file-backed FTW banks to an all-CPU MoE cache.
+
+    This is an experimental runtime boundary, not a default loader hook. File-backed mappings
+    have no device alias, so every layer must already be CPU-routed and prefill overlap must
+    be disabled exactly as ``OffloadMoeCache.set_bank_sources`` requires for PAGEABLE banks.
+    Mapping owners are retained on the cache so tensor storage outlives decode/prefill users.
+    """
+
+    num_layers = int(cache.num_layers)
+    expected_cpu_layers = frozenset(range(num_layers))
+    if frozenset(cache.cpu_layer_ids) != expected_cpu_layers:
+        raise ValueError(
+            "file-backed FTW sources currently require every MoE layer to be CPU-routed"
+        )
+    if bool(cache.prefill_overlap):
+        raise ValueError("file-backed PAGEABLE FTW sources require prefill overlap disabled")
+
+    bundle = map_ftw_expert_sources(
+        path,
+        num_layers,
+        expected_banks=set(cache.bank_schema),
+        expected_quant_format=str(cache.quant_format),
+        num_experts=(int(cache.num_experts) if num_experts is None else int(num_experts)),
+    )
+    cache.set_bank_sources(bundle.sources, bundle.layer_residency)
+    # Experimental owner anchor. No canonical cache ABI change is needed for this P1 boundary.
+    cache._file_backed_ftw_owners = tuple(bundle.owners)
+    return bundle
+
+
 __all__ = [
     "MappedFTWEntry",
     "MappedFTWExpertSources",
+    "attach_file_backed_ftw_sources",
     "map_ftw_entry",
     "map_ftw_expert_sources",
 ]
