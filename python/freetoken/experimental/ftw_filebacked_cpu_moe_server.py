@@ -1,9 +1,13 @@
-"""Experimental server launcher for all-CPU file-backed FTW MoE banks.
+"""Experimental server launcher for an all-CPU, file-backed FTW load path.
 
 Not wired into ``ft serve``. The launcher fails closed unless ``--moe-cpu-layers
-1.0`` is explicit and the checkpoint is already FTW. It replaces only the spawned
-worker's expert-bank loader; dense-weight loading and every normal launch surface are
-unchanged.
+1.0`` is explicit and the checkpoint is already FTW. Inside the spawned worker it
+replaces two host-memory-heavy FTW seams only:
+
+* dense weights use a direct file-backed iterator with no anonymous prefetch;
+* native NVFP4 expert banks use PAGEABLE MAP_PRIVATE per-layer tensors.
+
+Every normal FreeToken launch/default remains unchanged.
 """
 from __future__ import annotations
 
@@ -38,7 +42,7 @@ def _make_filebacked_expert_loader(original: Callable[..., Any]) -> Callable[...
         layer_sink=None,
         layer_residency=None,
     ):
-        # This experiment has no "quiet" fallback to the ordinary 18+ GiB anonymous
+        # This experiment has no quiet fallback to the ordinary 18+ GiB anonymous
         # bank path. Any mismatch is a hard stop before expert payload IO.
         if dummy:
             raise RuntimeError("file-backed CPU-MoE experiment does not support dummy weights")
@@ -70,12 +74,25 @@ def _make_filebacked_expert_loader(original: Callable[..., Any]) -> Callable[...
     return load
 
 
+def _install_filebacked_dense_iterator(ftw_mod) -> None:
+    """Install the low-RAM dense FTW reader on the worker-local FTW module."""
+    from freetoken.experimental.ftw_filebacked_dense import iter_ftw_weights_filebacked
+
+    ftw_mod.iter_ftw_weights = iter_ftw_weights_filebacked
+
+
 def _apply_worker_patch() -> None:
+    import freetoken.checkpoint.ftw as ftw_mod
     import freetoken.engine.engine as engine_mod
+
+    # Dense model load happens before the expert cache is initialized. load_weight()
+    # imports iter_ftw_weights from this module when called, so patch the module before
+    # Engine construction rather than trying to replace the already-imported load_weight.
+    _install_filebacked_dense_iterator(ftw_mod)
 
     # Plain Linux otherwise sees an uncapped pin budget and can leave explicit CPU
     # layers pinned. Zero activates the existing split-residency accounting; the
-    # experimental loader then maps all requested CPU layers file-backed PAGEABLE.
+    # experimental expert loader then maps all requested CPU layers file-backed PAGEABLE.
     engine_mod._pin_budget_bytes = lambda: 0  # type: ignore[attr-defined]
     engine_mod.load_expert_banks = _make_filebacked_expert_loader(  # type: ignore[assignment]
         engine_mod.load_expert_banks
