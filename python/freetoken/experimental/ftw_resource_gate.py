@@ -14,7 +14,7 @@ This gate accounts resources by *runtime/storage representation*, not checkpoint
   entire checkpoint by a generic 4x expansion.
 
 The legacy conservative RAM path remains available for callers that do not provide exact
-metadata-derived dense/expert envelopes. Passing this gate authorizes only the separate
+metadata-derived dense envelopes. Passing this gate authorizes only the separate
 experimental conversion step; it does not prove conversion, loading, serving, or inference.
 """
 from __future__ import annotations
@@ -303,9 +303,7 @@ def preflight_low_memory_nvfp4_conversion(
     _E, _H, _I, moe_layers = _geometry(model_config)
     expert_total = expert_layer * moe_layers
 
-    # Phase-13/15 output-envelope logic, now local to the exact native-FTW representation:
-    # source checkpoint expansion or native expert-bank + non-routed transform allowance,
-    # whichever is larger, followed by a post-conversion filesystem reserve.
+    # Phase-13/15 output-envelope logic, now local to the exact native-FTW representation.
     checkpoint_expand = (source_file_bytes * 135 + 99) // 100
     native_output = expert_total + (non_routed * 150 + 99) // 100
     disk_payload = max(checkpoint_expand, native_output)
@@ -326,9 +324,10 @@ def preflight_low_memory_nvfp4_conversion(
         if dense_peak < 0:
             raise ValueError("dense_anonymous_peak_bytes must be non-negative")
         if expert_anonymous_peak_bytes is None:
-            expert_peak = expert_layer
-            source_fragment_peak = 0
-            ram_model = "phase_max_exact_dense_one_layer_expert"
+            fragment = native_nvfp4_fragment_memory(model_config)
+            expert_peak = int(fragment["anonymous_generated_fragment_peak_bytes"])
+            source_fragment_peak = int(fragment["file_backed_source_fragment_peak_bytes"])
+            ram_model = "phase_max_exact_dense_fragment_expert_auto"
         else:
             expert_peak = int(expert_anonymous_peak_bytes)
             source_fragment_peak = int(expert_file_backed_fragment_peak_bytes or 0)
