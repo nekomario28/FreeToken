@@ -15,6 +15,7 @@ MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 make_loader = MODULE._make_low_memory_native_nvfp4_loader
 temporary_loader = MODULE._temporary_expert_loader
+temporary_cpu_device = MODULE._temporary_cpu_conversion_device
 require_preflight = MODULE._require_metadata_preflight
 
 
@@ -140,6 +141,62 @@ def test_temporary_loader_is_thread_scoped_and_restores_original_on_success_and_
             assert module.load_expert_banks("owner-2") == "replacement"
             raise RuntimeError("boom")
     assert module.load_expert_banks is original
+
+
+def test_cpu_conversion_device_shim_is_owner_thread_only_and_preserves_cuda_calls():
+    calls = []
+
+    class FakeDevice:
+        def __init__(self, value):
+            self.type = str(value).split(":", 1)[0]
+
+    class FakeCuda:
+        def set_device(self, device):
+            calls.append((threading.get_ident(), str(device)))
+            return "original"
+
+    fake_torch = SimpleNamespace(device=FakeDevice, cuda=FakeCuda())
+    original = fake_torch.cuda.set_device
+    owner = threading.get_ident()
+
+    with temporary_cpu_device(fake_torch):
+        # The one special case: owner-thread CPU conversion skips cuda.set_device(cpu).
+        assert fake_torch.cuda.set_device("cpu") is None
+        assert calls == []
+
+        # Owner-thread CUDA behavior remains canonical.
+        assert fake_torch.cuda.set_device("cuda:0") == "original"
+        assert calls == [(owner, "cuda:0")]
+
+        # Another thread never inherits the CPU exception.
+        other = []
+        thread = threading.Thread(target=lambda: other.append(fake_torch.cuda.set_device("cpu")))
+        thread.start()
+        thread.join()
+        assert other == ["original"]
+        assert calls[-1][1] == "cpu"
+        assert calls[-1][0] != owner
+
+    # Restoration must hold even though the saved object is a bound method.
+    assert fake_torch.cuda.set_device.__func__ is original.__func__
+
+
+def test_cpu_conversion_device_shim_restores_after_failure():
+    class FakeDevice:
+        def __init__(self, value):
+            self.type = str(value).split(":", 1)[0]
+
+    class FakeCuda:
+        def set_device(self, _device):
+            return "original"
+
+    fake_torch = SimpleNamespace(device=FakeDevice, cuda=FakeCuda())
+    original = fake_torch.cuda.set_device
+    with pytest.raises(RuntimeError, match="boom"):
+        with temporary_cpu_device(fake_torch):
+            assert fake_torch.cuda.set_device("cpu") is None
+            raise RuntimeError("boom")
+    assert fake_torch.cuda.set_device.__func__ is original.__func__
 
 
 def test_metadata_preflight_blocks_before_conversion_contract_is_entered():
