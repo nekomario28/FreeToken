@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import types
+from enum import Enum
 from pathlib import Path
 
 import pytest
@@ -12,14 +13,19 @@ import torch
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = ROOT / "python" / "freetoken"
 CHECKPOINT_ROOT = PACKAGE_ROOT / "checkpoint"
+MOE_ROOT = PACKAGE_ROOT / "moe"
 
-# Load only the two experiment modules, not freetoken.checkpoint.__init__ and its wider deps.
+# Load only the experiment modules plus the exact offload_cache source under minimal stubs;
+# do not import freetoken.checkpoint.__init__ or initialize CUDA/runtime backends.
 freetoken_pkg = types.ModuleType("freetoken")
 freetoken_pkg.__path__ = [str(PACKAGE_ROOT)]
 checkpoint_pkg = types.ModuleType("freetoken.checkpoint")
 checkpoint_pkg.__path__ = [str(CHECKPOINT_ROOT)]
+moe_pkg = types.ModuleType("freetoken.moe")
+moe_pkg.__path__ = [str(MOE_ROOT)]
 sys.modules.setdefault("freetoken", freetoken_pkg)
 sys.modules.setdefault("freetoken.checkpoint", checkpoint_pkg)
+sys.modules.setdefault("freetoken.moe", moe_pkg)
 
 
 def _load(name: str, path: Path):
@@ -35,17 +41,16 @@ CORE = _load("freetoken.checkpoint.mapped_ftw_core", CHECKPOINT_ROOT / "mapped_f
 MAPPED = _load("freetoken.checkpoint.mapped_ftw", CHECKPOINT_ROOT / "mapped_ftw.py")
 
 
-def _write_two_layer_fixture(tmp_path: Path):
-    bank_order = ["gate_up_packed", "down_packed"]
+def _write_fixture(tmp_path: Path, bank_order: list[str]):
     offsets = {}
-    raw = bytearray(4 * 4096)
+    raw = bytearray(len(bank_order) * 2 * 4096)
     tensors = []
     values = {}
     slot = 0
     for bank in bank_order:
         for layer in range(2):
             offset = slot * 4096
-            payload = bytes([10 * (slot + 1) + i for i in range(8)])
+            payload = bytes([(10 * (slot + 1) + i) % 256 for i in range(8)])
             raw[offset:offset + 8] = payload
             name = f"{bank}#L{layer:05d}"
             offsets[name] = offset
@@ -70,6 +75,10 @@ def _write_two_layer_fixture(tmp_path: Path):
         "shards": [{"file": shard.name, "global_off": 0, "nbytes": len(raw)}],
     }), encoding="utf-8")
     return shard, offsets, values
+
+
+def _write_two_layer_fixture(tmp_path: Path):
+    return _write_fixture(tmp_path, ["gate_up_packed", "down_packed"])
 
 
 def test_bundle_matches_existing_bank_sources_contract_and_keeps_owners(tmp_path):
@@ -97,7 +106,6 @@ def test_bundle_matches_existing_bank_sources_contract_and_keeps_owners(tmp_path
             assert tuple(tensor.shape) == (2, 4)
             assert bytes(tensor.flatten().tolist()) == values[name]
 
-    # The tensor is writable for PyTorch, but ACCESS_COPY must not modify the checkpoint.
     target = bundle.sources["gate_up_packed"][0]
     original_file_byte = shard.read_bytes()[offsets["gate_up_packed#L00000"]]
     target[0, 0] = 255
@@ -140,3 +148,64 @@ def test_generic_entry_adapter_checks_shape_dtype_nbytes(tmp_path):
     (tmp_path / CORE.INDEX_NAME).write_text(json.dumps(index), encoding="utf-8")
     with pytest.raises(ValueError, match="shape/dtype"):
         MAPPED.map_ftw_entry(tmp_path, "x")
+
+
+def test_exact_offload_cache_accepts_file_backed_sources_as_cpu_pageable(tmp_path):
+    native_nvfp4 = [
+        "gate_up_packed", "gate_up_scale", "gate_up_global",
+        "down_packed", "down_scale", "down_global",
+    ]
+    _write_fixture(tmp_path, native_nvfp4)
+    bundle = MAPPED.map_ftw_expert_sources(
+        tmp_path,
+        2,
+        expected_banks=set(native_nvfp4),
+        expected_quant_format="nvfp4",
+        num_experts=2,
+    )
+
+    class _Logger:
+        def __getattr__(self, _name):
+            return lambda *_args, **_kwargs: None
+
+    utils = types.ModuleType("freetoken.utils")
+    utils.init_logger = lambda *_args, **_kwargs: _Logger()
+    sys.modules["freetoken.utils"] = utils
+
+    flashlib = types.ModuleType("flashlib")
+    kernels = types.ModuleType("flashlib.kernels")
+    slot_cache = types.ModuleType("flashlib.kernels.slot_cache")
+    slot_cache.N_STATS = 4
+    slot_cache.Stat = type("Stat", (), {})
+    sys.modules["flashlib"] = flashlib
+    sys.modules["flashlib.kernels"] = kernels
+    sys.modules["flashlib.kernels.slot_cache"] = slot_cache
+
+    class HostResidency(Enum):
+        PINNED = "pinned"
+        LOCKED = "locked"
+        PAGEABLE = "pageable"
+
+    host_banks = types.ModuleType("freetoken.moe.host_banks")
+    host_banks.HostResidency = HostResidency
+    sys.modules["freetoken.moe.host_banks"] = host_banks
+
+    offload = _load("freetoken.moe.offload_cache", MOE_ROOT / "offload_cache.py")
+    cache = offload.OffloadMoeCache(
+        num_layers=2,
+        num_experts=2,
+        cache_size=2,
+        device=torch.device("cpu"),
+        quant_format="nvfp4",
+        decode_target="cpu",
+    )
+    cache.cpu_layer_ids = frozenset({0, 1})
+    cache.set_bank_sources(bundle.sources, bundle.layer_residency)
+
+    assert cache.layer_residency == ["pageable", "pageable"]
+    assert cache._unpinned_layers == frozenset({0, 1})
+    assert set(cache.bank_sources) == set(native_nvfp4)
+    assert len(cache.banks) == len(native_nvfp4)
+    for name in native_nvfp4:
+        assert len(cache.bank_sources[name]) == 2
+        assert cache.bank_sources[name][0].data_ptr() == bundle.sources[name][0].data_ptr()
