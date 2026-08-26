@@ -29,37 +29,69 @@ torch::Tensor ggml_moe_a8_vec(
   DISPATCH_FLOAT_TYPES(X.scalar_type(), "ggml_moe_vec_a8", [&] {
     quantize_row_q8_1_cuda<scalar_t>(
         (scalar_t*)X.data_ptr(), (void*)quant_X.data_ptr(), col, tokens, stream);
-#define FT_MOE_VEC_CASE(TYPE, FN) \
-    case TYPE: \
-      FN<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), \
-                   (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream); \
-      break
     switch (type) {
-      FT_MOE_VEC_CASE(2, moe_vec_q4_0_q8_1_cuda);
-      FT_MOE_VEC_CASE(3, moe_vec_q4_1_q8_1_cuda);
-      FT_MOE_VEC_CASE(6, moe_vec_q5_0_q8_1_cuda);
-      FT_MOE_VEC_CASE(7, moe_vec_q5_1_q8_1_cuda);
-      FT_MOE_VEC_CASE(8, moe_vec_q8_0_q8_1_cuda);
-      FT_MOE_VEC_CASE(10, moe_vec_q2_K_q8_1_cuda);
-      FT_MOE_VEC_CASE(11, moe_vec_q3_K_q8_1_cuda);
-      FT_MOE_VEC_CASE(12, moe_vec_q4_K_q8_1_cuda);
-      FT_MOE_VEC_CASE(13, moe_vec_q5_K_q8_1_cuda);
-      FT_MOE_VEC_CASE(14, moe_vec_q6_K_q8_1_cuda);
-      FT_MOE_VEC_CASE(16, moe_vec_iq2_xxs_q8_1_cuda);
-      FT_MOE_VEC_CASE(17, moe_vec_iq2_xs_q8_1_cuda);
-      FT_MOE_VEC_CASE(18, moe_vec_iq3_xxs_q8_1_cuda);
-      FT_MOE_VEC_CASE(19, moe_vec_iq1_s_q8_1_cuda);
-      FT_MOE_VEC_CASE(20, moe_vec_iq4_nl_q8_1_cuda);
-      FT_MOE_VEC_CASE(21, moe_vec_iq3_s_q8_1_cuda);
-      FT_MOE_VEC_CASE(22, moe_vec_iq2_s_q8_1_cuda);
-      FT_MOE_VEC_CASE(23, moe_vec_iq4_xs_q8_1_cuda);
-      FT_MOE_VEC_CASE(29, moe_vec_iq1_m_q8_1_cuda);
+      case 2:
+        moe_vec_q4_0_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 3:
+        moe_vec_q4_1_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 6:
+        moe_vec_q5_0_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 7:
+        moe_vec_q5_1_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 8:
+        moe_vec_q8_0_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 10:
+        moe_vec_q2_K_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 11:
+        moe_vec_q3_K_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 12:
+        moe_vec_q4_K_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 13:
+        moe_vec_q5_K_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 14:
+        moe_vec_q6_K_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 16:
+        moe_vec_iq2_xxs_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 17:
+        moe_vec_iq2_xs_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 18:
+        moe_vec_iq3_xxs_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 19:
+        moe_vec_iq1_s_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 20:
+        moe_vec_iq4_nl_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 21:
+        moe_vec_iq3_s_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 22:
+        moe_vec_iq2_s_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 23:
+        moe_vec_iq4_xs_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
+      case 29:
+        moe_vec_iq1_m_q8_1_cuda<scalar_t>(W.data_ptr(), quant_X.data_ptr(), (scalar_t*)Y.data_ptr(), (int*)topk_ids.data_ptr(), top_k, tokens, col, row, quant_X.stride(0), stream);
+        break;
       default:
         TORCH_CHECK(false, "ggml_moe_a8_vec: unsupported GGUF quant type ", type,
                     " (MMVQ kernels exist for Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/Q2_K-Q6_K/IQ2_XXS/IQ2_XS/"
                     "IQ3_XXS/IQ1_S/IQ4_NL/IQ3_S/IQ2_S/IQ4_XS/IQ1_M)");
     }
-#undef FT_MOE_VEC_CASE
   });
   return Y;
 }
