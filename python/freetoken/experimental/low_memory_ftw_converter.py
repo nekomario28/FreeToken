@@ -1,6 +1,6 @@
 """Opt-in low-memory FTW conversion for the file-backed CPU MoE experiment.
 
-The canonical ``ft checkpoint`` path is intentionally unchanged.  This wrapper runs the
+The canonical ``ft checkpoint`` path is intentionally unchanged. This wrapper runs the
 canonical :func:`freetoken.checkpoint.convert.convert_checkpoint` while temporarily replacing
 only its expert-bank provider with the already-tested one-MoE-layer-at-a-time NVFP4 streamer.
 Dense conversion, metadata copying, FTW writing/finalization, and source fingerprinting remain
@@ -13,7 +13,7 @@ The experiment is deliberately narrow and fail-closed:
 * no dummy banks, no caller-supplied residency plan, no serving fallback;
 * native ``nvfp4`` FTW banks, intended for the separate file-backed CPU-only server experiment.
 
-This module does not authorize a real checkpoint conversion.  External architecture/resource
+This module does not authorize a real checkpoint conversion. External architecture/resource
 admission must pass before real weight payloads are read.
 """
 from __future__ import annotations
@@ -61,57 +61,64 @@ def _stream_one_layer_at_a_time(model_path: str, model_config, source_spec, laye
     )
 
 
-def _low_memory_load_expert_banks(
-    model_path,
-    model_config,
+def _make_low_memory_loader(
+    expert_banks_cls,
     *,
-    device,
-    dtype,
-    dummy: bool = False,
-    parallel=None,
-    workers: int = 8,
-    chunk: int = 8 << 20,
-    decode_target: str = "gpu",
-    layer_sink=None,
-    layer_residency=None,
+    source_spec_for_model: Callable[[Any], Any] = _source_spec_for_model,
+    stream_one_layer: Callable[[str, Any, Any, Any], dict] = _stream_one_layer_at_a_time,
 ):
-    """Canonical ``load_expert_banks``-shape adapter for converter-only streaming.
+    """Build the canonical ``load_expert_banks``-shape converter adapter.
 
-    The canonical converter supplies ``layer_sink``.  We stream directly into that sink and
-    return an empty source shell marked ``streamed=True`` because the converter intentionally
-    consumes no expert tensors after the sink has written and released each layer.
+    Dependency injection keeps the contract testable with the workflow's minimal CPU
+    dependency set; production supplies the real ``ExpertBanks`` class and lazy source helpers.
     """
-    del device, dtype, workers, chunk, decode_target
-    if dummy:
-        raise ValueError("low-memory FTW conversion does not support dummy expert banks")
-    if layer_sink is None:
-        raise ValueError("low-memory FTW conversion requires the canonical converter layer sink")
-    if layer_residency is not None:
-        raise ValueError("low-memory FTW conversion does not accept a serving residency plan")
-    if parallel not in (None, False):
-        raise ValueError("low-memory FTW conversion owns serial one-layer source scheduling")
 
-    source_spec = _source_spec_for_model(model_config)
-    _stream_one_layer_at_a_time(model_path, model_config, source_spec, layer_sink)
+    def load_expert_banks(
+        model_path,
+        model_config,
+        *,
+        device,
+        dtype,
+        dummy: bool = False,
+        parallel=None,
+        workers: int = 8,
+        chunk: int = 8 << 20,
+        decode_target: str = "gpu",
+        layer_sink=None,
+        layer_residency=None,
+    ):
+        del device, dtype, workers, chunk, decode_target
+        if dummy:
+            raise ValueError("low-memory FTW conversion does not support dummy expert banks")
+        if layer_sink is None:
+            raise ValueError("low-memory FTW conversion requires the canonical converter layer sink")
+        if layer_residency is not None:
+            raise ValueError("low-memory FTW conversion does not accept a serving residency plan")
+        if parallel not in (None, False):
+            raise ValueError("low-memory FTW conversion owns serial one-layer source scheduling")
 
-    from freetoken.moe.expert_banks import ExpertBanks
+        source_spec = source_spec_for_model(model_config)
+        stream_one_layer(model_path, model_config, source_spec, layer_sink)
+        return expert_banks_cls(
+            "nvfp4",
+            {name: [] for name in _NATIVE_NVFP4_BANKS},
+            streamed=True,
+        )
 
-    return ExpertBanks(
-        "nvfp4",
-        {name: [] for name in _NATIVE_NVFP4_BANKS},
-        streamed=True,
-    )
+    return load_expert_banks
 
 
 @contextmanager
-def _patched_expert_loader() -> Iterator[None]:
+def _patched_expert_loader(expert_banks_mod=None) -> Iterator[Callable[..., Any]]:
     """Install the converter-only provider for one bounded call and always restore it."""
-    import freetoken.moe.expert_banks as expert_banks_mod
+    if expert_banks_mod is None:
+        import freetoken.moe.expert_banks as expert_banks_mod
 
     original = expert_banks_mod.load_expert_banks
-    expert_banks_mod.load_expert_banks = _low_memory_load_expert_banks
+    replacement = _make_low_memory_loader(expert_banks_mod.ExpertBanks)
+    expert_banks_mod.load_expert_banks = replacement
     try:
-        yield
+        yield replacement
     finally:
         expert_banks_mod.load_expert_banks = original
 
@@ -125,12 +132,14 @@ def convert_checkpoint_low_memory_nvfp4(
     shard_limit: int | None = None,
     device: str | None = None,
     _convert_fn: Callable[..., Any] | None = None,
+    _expert_banks_mod=None,
 ):
     """Run canonical FTW conversion with the bounded one-layer NVFP4 expert provider.
 
-    ``_convert_fn`` is an internal test seam.  Production calls leave it ``None`` and execute
-    the repository's canonical converter.  ``moe_backend`` must stay ``offload`` because the
-    output expert-bank layout is specifically the native CPU-MoE ``nvfp4`` ABI.
+    ``_convert_fn`` and ``_expert_banks_mod`` are internal test seams. Production calls leave
+    both unset and execute the repository's canonical converter against the real provider
+    module. ``moe_backend`` must stay ``offload`` because the output expert-bank layout is the
+    native CPU-MoE ``nvfp4`` ABI.
     """
     if moe_backend != "offload":
         raise ValueError("low-memory FTW conversion requires moe_backend='offload'")
@@ -145,7 +154,6 @@ def convert_checkpoint_low_memory_nvfp4(
         if shard_limit is None:
             shard_limit = DEFAULT_SHARD_LIMIT
     elif shard_limit is None:
-        # The injected test converter owns its own default; avoid importing the full FTW stack.
         shard_limit = 8 << 30
 
     kwargs = {
@@ -154,12 +162,12 @@ def convert_checkpoint_low_memory_nvfp4(
         "shard_limit": shard_limit,
         "device": device,
     }
-    with _patched_expert_loader():
+    with _patched_expert_loader(_expert_banks_mod):
         return _convert_fn(model_path, out_dir, **kwargs)
 
 
 __all__ = [
     "convert_checkpoint_low_memory_nvfp4",
-    "_low_memory_load_expert_banks",
+    "_make_low_memory_loader",
     "_patched_expert_loader",
 ]
