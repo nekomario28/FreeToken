@@ -11,7 +11,11 @@ layer at a time:
 
     allocate one layer -> read only that layer -> sink(layer) -> release -> next layer
 
-The sink owns the layer HostBanks exactly like ``checkpoint.convert._ConvertSink`` does.
+``stream_nvfp4_layers_to_ftw`` is the converter bridge: it writes every bank of that one
+layer as a ``bank#Lxxxxx`` FTW ``experts_bank`` entry and releases the layer before the next
+allocation. It therefore preserves the hard one-layer allocation bound all the way through
+the FTW writer boundary.
+
 The function never pins the banks and never constructs a whole-model ExpertBanks object.
 It trades repeated shard opens for a hard one-layer expert-bank allocation bound.
 """
@@ -225,4 +229,59 @@ def stream_nvfp4_layers_serial(
     }
 
 
-__all__ = ["stream_nvfp4_layers_serial"]
+def stream_nvfp4_layers_to_ftw(
+    model_path: str,
+    config,
+    spec: Any,
+    *,
+    writer: Any,
+    drop_page_cache: DropPageCache,
+    alloc_layer: Callable[[int, int, int], dict] | None = None,
+) -> dict[str, int]:
+    """Write one-layer-at-a-time native NVFP4 banks into an FTW writer.
+
+    ``writer`` only needs the canonical ``add_tensor(name, tensor, kind=...)`` method. Each
+    bank is written as ``<bank>#L<layer:05d>`` with ``kind='experts_bank'``. All six banks
+    of the layer are released in a ``finally`` block, including when the writer fails, so a
+    conversion error cannot strand the current layer's resident pages or permit a second
+    live layer to be allocated accidentally.
+    """
+    entries_written = 0
+    bytes_written = 0
+
+    def _sink(layer_id: int, banks: dict) -> None:
+        nonlocal entries_written, bytes_written
+        try:
+            for bank_name, bank in banks.items():
+                writer.add_tensor(
+                    f"{bank_name}#L{layer_id:05d}",
+                    bank.tensor,
+                    kind="experts_bank",
+                )
+                entries_written += 1
+                bytes_written += int(bank.nbytes)
+        finally:
+            for bank in banks.values():
+                bank.release()
+
+    stats = stream_nvfp4_layers_serial(
+        model_path,
+        config,
+        spec,
+        drop_page_cache=drop_page_cache,
+        layer_sink=_sink,
+        alloc_layer=alloc_layer,
+    )
+    if bytes_written != stats["expert_bank_bytes_streamed"]:
+        raise AssertionError(
+            f"FTW writer accounted {bytes_written} expert bytes, "
+            f"streamer accounted {stats['expert_bank_bytes_streamed']}"
+        )
+    return {
+        **stats,
+        "ftw_entries_written": entries_written,
+        "ftw_expert_bytes_written": bytes_written,
+    }
+
+
+__all__ = ["stream_nvfp4_layers_serial", "stream_nvfp4_layers_to_ftw"]
