@@ -1,24 +1,20 @@
-"""Opt-in low-memory native-NVFP4 -> FTW conversion for the CPU file-backed experiment.
+"""Safety wrapper for the opt-in Qwen3.5 native-NVFP4 low-memory FTW experiment.
 
-This is deliberately separate from ``ft checkpoint``.  The canonical converter may choose a
-GPU-specific NVFP4 layout (marlin/b12x); silently replacing that with native CPU-readable
-NVFP4 would change normal serving semantics.  This module instead provides an explicit
-Qwen3.5-MoE/native-NVFP4 path whose safety properties are different and intentionally narrow:
+The heavy conversion path intentionally reuses the canonical FTW converter.  Only its
+expert-bank provider is replaced, for one bounded call, by
+``experimental.low_memory_ftw_converter``.  This module owns the outer admission/publication
+contract:
 
-* default CLI action is **preflight only**; real conversion requires ``--execute``;
-* preflight inspects lightweight HF config + safetensors headers before importing the Qwen
-  runtime/model/weight stack;
-* the resource gate runs before any output is created;
-* routed experts use the strict one-layer streamer, so only one native expert-bank layer is
-  resident at a time;
-* the checkpoint is built in a hidden sibling staging directory and published with one rename
-  only after ``FTWWriter.finalize`` succeeds;
-* a failed conversion closes the writer and removes the staging directory, leaving the final
-  output path unpublished.
+* CLI defaults to read-only preflight; ``--execute`` is explicit;
+* preflight inspects lightweight HF config + safetensors headers before model/runtime imports;
+* execution re-parses the runtime config after admission and cross-checks the dimensions;
+* canonical conversion writes into a hidden sibling staging directory;
+* the resulting canonical FTW index is validated as native NVFP4 with all expected layers;
+* a machine-readable receipt is written before publication;
+* the final output name appears only after the staged conversion is complete;
+* any failure removes the staging directory and leaves the final output unpublished.
 
-The first production target is the HF ``Qwen3_5MoeForConditionalGeneration`` family with
-routed experts detected as native NVFP4.  Other architectures/formats fail closed until they
-have an explicit source-spec contract and equivalent tests.
+The normal ``ft checkpoint`` and normal serving paths remain unchanged.
 """
 from __future__ import annotations
 
@@ -29,13 +25,14 @@ import shutil
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 from .ftw_resource_gate import preflight_low_memory_nvfp4_conversion
 
 _DEFAULT_SHARD_LIMIT = 8 << 30
 _SUPPORTED_ARCH = "Qwen3_5MoeForConditionalGeneration"
 _CONVERSION_TARGET = "cpu_file_backed_native_nvfp4"
+_RECEIPT_NAME = "freetoken_low_memory_conversion_receipt.json"
 
 
 def _get(obj: Any, key: str, default=None):
@@ -73,7 +70,7 @@ def _routed_expert_quant_from_hf(hf_config: Any) -> str:
 
 
 def _preflight_config_from_hf(hf_config: Any):
-    """Extract only fields needed by the resource gate, without model/runtime imports."""
+    """Extract only fields required by the resource gate; do not import model/runtime code."""
     architectures = _architectures_from_hf(hf_config)
     if _SUPPORTED_ARCH not in architectures:
         raise ValueError(
@@ -87,11 +84,7 @@ def _preflight_config_from_hf(hf_config: Any):
     num_experts = int(_get(text, "num_experts", 0) or 0)
     hidden_size = int(_get(text, "hidden_size", 0) or 0)
     moe_intermediate_size = int(_get(text, "moe_intermediate_size", 0) or 0)
-    num_layers = int(
-        _get(text, "num_hidden_layers", None)
-        or _get(text, "num_layers", 0)
-        or 0
-    )
+    num_layers = int(_get(text, "num_hidden_layers", None) or _get(text, "num_layers", 0) or 0)
     if min(num_experts, hidden_size, moe_intermediate_size, num_layers) <= 0:
         raise ValueError(
             "Qwen3.5 preflight config is missing positive num_experts/hidden_size/"
@@ -116,7 +109,7 @@ def _resolve_qwen35_preflight_config(model_path: str):
 
 
 def _resolve_qwen35_runtime_config(model_path: str, preflight_config: Any):
-    """Import the real Qwen runtime parser only after resource admission succeeded."""
+    """Import the real Qwen parser only after the read-only resource gate passed."""
     from freetoken.utils import cached_load_hf_config
     from freetoken.models.qwen3_5_moe.config import parse_config
 
@@ -139,44 +132,50 @@ def _resolve_qwen35_runtime_config(model_path: str, preflight_config: Any):
     return model_config
 
 
-def _abort_writer(writer: Any) -> None:
-    """Best-effort close for an FTWWriter that failed before ``finalize``."""
-    handle = getattr(writer, "_f", None)
-    if handle is not None:
-        try:
-            handle.close()
-        finally:
-            try:
-                writer._f = None
-            except Exception:
-                pass
-
-
 def _staging_dir(output: Path) -> Path:
     return output.parent / f".{output.name}.partial-{os.getpid()}-{uuid.uuid4().hex}"
 
 
-def _write_native_nvfp4_ftw(
+def _validate_canonical_index(index: Any, expected_layers: int) -> dict:
+    if not isinstance(index, dict):
+        raise RuntimeError("canonical FTW converter returned a non-object index")
+    if index.get("quant_format") != "nvfp4":
+        raise RuntimeError(
+            "canonical low-memory conversion produced unexpected quant_format="
+            f"{index.get('quant_format')!r}"
+        )
+    got_layers = int(index.get("expert_bank_num_layers") or 0)
+    if got_layers != int(expected_layers):
+        raise RuntimeError(
+            f"canonical low-memory conversion wrote {got_layers} expert layers, "
+            f"expected {expected_layers}"
+        )
+    counts = index.get("counts") or {}
+    if int(counts.get("experts_bank", 0)) <= 0:
+        raise RuntimeError("canonical low-memory conversion produced no expert-bank entries")
+    return index
+
+
+def _write_receipt(staging: Path, receipt: dict[str, Any]) -> None:
+    path = staging / _RECEIPT_NAME
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(receipt, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def _atomic_staged_canonical_conversion(
     model_path: str,
     out_dir: str,
-    model_config: Any,
-    spec: Any,
     *,
-    dense_weights: Callable[[], Iterable[tuple[str, Any]]],
-    expert_streamer: Callable[..., dict[str, int]],
-    writer_factory: Callable[..., Any],
-    metadata_copier: Callable[[str, str], list[str]],
-    drop_page_cache: Callable[[str], None],
-    fingerprint: str | None,
-    shard_limit: int = _DEFAULT_SHARD_LIMIT,
-    alloc_layer: Callable[[int, int, int], dict] | None = None,
-) -> dict:
-    """Build then atomically publish one CPU-target FTW checkpoint.
-
-    Resource admission is intentionally *outside* this low-level function so synthetic tests
-    can exercise the writer/publish boundary with tiny fixtures.  The public execution path
-    below always calls the preflight gate first.
-    """
+    model_config: Any,
+    preflight_report: Any,
+    convert_fn: Callable[..., dict],
+    shard_limit: int,
+    device: str,
+) -> tuple[dict, dict[str, Any]]:
+    """Run an admitted canonical conversion in a sibling staging dir, then publish it."""
     output = Path(out_dir)
     if output.exists():
         raise ValueError(
@@ -187,63 +186,42 @@ def _write_native_nvfp4_ftw(
     if staging.exists():
         raise RuntimeError(f"unexpected pre-existing staging directory: {staging}")
 
-    writer = None
     published = False
     try:
-        writer = writer_factory(str(staging), shard_limit=shard_limit)
-        dense_count = 0
-        dense_bytes = 0
-        for name, tensor in dense_weights():
-            writer.add_tensor(name, tensor, kind="weight")
-            dense_count += 1
-            dense_bytes += int(tensor.numel()) * int(tensor.element_size())
-
-        expert_stats = expert_streamer(
+        index = convert_fn(
             model_path,
-            model_config,
-            spec,
-            writer=writer,
-            drop_page_cache=drop_page_cache,
-            alloc_layer=alloc_layer,
+            str(staging),
+            shard_limit=shard_limit,
+            device=device,
         )
-        num_layers = int(expert_stats["layers_streamed"])
-        expected_layers = int(model_config.num_moe_layers)
-        if num_layers != expected_layers:
-            raise RuntimeError(
-                f"strict NVFP4 streamer wrote {num_layers} layers, expected {expected_layers}"
-            )
-        expert_entries = int(expert_stats["ftw_entries_written"])
-        expert_bytes = int(expert_stats["ftw_expert_bytes_written"])
-        if expert_entries <= 0 or expert_bytes <= 0:
-            raise RuntimeError("strict NVFP4 streamer produced no expert-bank payload")
-
-        copied = metadata_copier(model_path, str(staging))
-        index = writer.finalize({
-            "source_model_path": os.path.abspath(model_path),
-            "fingerprint": fingerprint,
-            "quant_format": "nvfp4",
-            "expert_bank_num_layers": num_layers,
+        _validate_canonical_index(index, int(model_config.num_moe_layers))
+        receipt = {
+            "architecture": _SUPPORTED_ARCH,
             "conversion_target": _CONVERSION_TARGET,
-            "counts": {"weight": dense_count, "experts_bank": expert_entries},
-            "bytes": {"weight": dense_bytes, "experts_bank": expert_bytes},
-            "copied_metadata": copied,
-        })
+            "model_path": os.path.abspath(model_path),
+            "out_dir": os.path.abspath(out_dir),
+            "device": device,
+            "resources": preflight_report.as_dict(),
+            "counts": index.get("counts"),
+            "fingerprint": index.get("fingerprint"),
+            "quant_format": index.get("quant_format"),
+            "expert_bank_num_layers": index.get("expert_bank_num_layers"),
+        }
+        _write_receipt(staging, receipt)
 
-        # The final path remains absent until every shard, index, and metadata file is closed.
+        # Staging is a sibling of output, so this does not cross filesystems. The target was
+        # required to be absent before conversion; any ordinary publication failure leaves the
+        # final name unpublished and is cleaned below.
         os.rename(staging, output)
         published = True
-        return index
-    except BaseException:
-        if writer is not None:
-            _abort_writer(writer)
-        raise
+        return index, receipt
     finally:
         if not published:
             shutil.rmtree(staging, ignore_errors=True)
 
 
 def preflight_qwen35_native_nvfp4(model_path: str, out_dir: str) -> dict[str, Any]:
-    """Read-only admission report.  Never creates the output directory."""
+    """Read-only admission report. Never creates the output directory."""
     model_config = _resolve_qwen35_preflight_config(model_path)
     report = preflight_low_memory_nvfp4_conversion(model_path, out_dir, model_config)
     return {
@@ -261,60 +239,40 @@ def execute_qwen35_native_nvfp4(
     out_dir: str,
     *,
     shard_limit: int = _DEFAULT_SHARD_LIMIT,
+    device: str = "cuda:0",
 ) -> dict[str, Any]:
-    """Run the admitted experimental conversion.  This is never the CLI default."""
+    """Run the admitted experiment. This is never the CLI default."""
     preflight_config = _resolve_qwen35_preflight_config(model_path)
     report = preflight_low_memory_nvfp4_conversion(model_path, out_dir, preflight_config)
     if Path(out_dir).exists():
-        # The generic gate permits an empty directory for inspection workflows. Atomic publish
-        # does not: refusing it avoids deleting/replacing a user-owned directory.
+        # The generic preflight permits an empty directory for inspection. Atomic publication
+        # deliberately does not replace even an empty user-owned directory.
         raise ValueError("--execute requires --out to not exist; choose a fresh output path")
 
-    # Runtime/model/kernel imports begin only after the read-only resource gate is green.
+    # Heavy/runtime imports start only after admission.
     import torch
 
-    model_config = _resolve_qwen35_runtime_config(model_path, preflight_config)
+    runtime_config = _resolve_qwen35_runtime_config(model_path, preflight_config)
+    from .low_memory_ftw_converter import convert_checkpoint_low_memory_nvfp4
 
-    # Match canonical FTW conversion's single-process invariant before loading dense weights.
-    from freetoken.distributed import set_tp_info, try_get_tp_info
-
-    tp = try_get_tp_info()
-    if tp is None:
-        set_tp_info(rank=0, size=1)
-        tp = try_get_tp_info()
-    if tp is None or tp.size != 1:
-        raise RuntimeError(
-            "experimental FTW conversion requires TP size 1 before weight loading"
+    def _convert(model: str, staging: str, *, shard_limit: int, device: str):
+        return convert_checkpoint_low_memory_nvfp4(
+            model,
+            staging,
+            dtype=torch.bfloat16,
+            moe_backend="offload",
+            shard_limit=shard_limit,
+            device=device,
         )
 
-    from freetoken.checkpoint.convert import _copy_metadata, _source_fingerprint
-    from freetoken.checkpoint.ftw import FTWWriter
-    from freetoken.checkpoint.low_memory_nvfp4 import stream_nvfp4_layers_to_ftw
-    from freetoken.models.loader import drop_page_cache
-    from freetoken.models.qwen3_5_moe.weight import _NVFP4_SOURCE_SPEC
-    from freetoken.models.weight import load_weight
-
-    try:
-        fingerprint = _source_fingerprint(
-            model_path, model_config, device=torch.device("cuda:0")
-        )
-    except Exception:
-        fingerprint = None
-
-    index = _write_native_nvfp4_ftw(
+    index, receipt = _atomic_staged_canonical_conversion(
         model_path,
         out_dir,
-        model_config,
-        _NVFP4_SOURCE_SPEC,
-        dense_weights=lambda: load_weight(
-            model_path, torch.device("cpu"), include_moe_experts=False
-        ),
-        expert_streamer=stream_nvfp4_layers_to_ftw,
-        writer_factory=FTWWriter,
-        metadata_copier=_copy_metadata,
-        drop_page_cache=drop_page_cache,
-        fingerprint=fingerprint,
+        model_config=runtime_config,
+        preflight_report=report,
+        convert_fn=_convert,
         shard_limit=shard_limit,
+        device=device,
     )
     return {
         "mode": "executed",
@@ -324,8 +282,9 @@ def execute_qwen35_native_nvfp4(
         "out_dir": os.path.abspath(out_dir),
         "resources": report.as_dict(),
         "counts": index.get("counts"),
-        "bytes": index.get("bytes"),
         "fingerprint": index.get("fingerprint"),
+        "receipt": os.path.join(os.path.abspath(out_dir), _RECEIPT_NAME),
+        "device": receipt["device"],
     }
 
 
@@ -345,6 +304,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="actually convert; without this flag the command is read-only preflight",
     )
     parser.add_argument(
+        "--device",
+        default="cuda:0",
+        help="torch device used by the canonical converter during --execute (default: cuda:0)",
+    )
+    parser.add_argument(
         "--shard-limit-gib",
         type=float,
         default=8.0,
@@ -358,14 +322,16 @@ def main(argv: list[str] | None = None) -> None:
     if args.shard_limit_gib <= 0:
         raise SystemExit("--shard-limit-gib must be > 0")
     shard_limit = int(args.shard_limit_gib * (1 << 30))
-    # FTW requires block-aligned shard boundaries.
     shard_limit = (shard_limit // 4096) * 4096
     if shard_limit <= 0:
         raise SystemExit("--shard-limit-gib is too small after 4096-byte alignment")
 
     if args.execute:
         result = execute_qwen35_native_nvfp4(
-            args.model, args.out, shard_limit=shard_limit
+            args.model,
+            args.out,
+            shard_limit=shard_limit,
+            device=args.device,
         )
     else:
         result = preflight_qwen35_native_nvfp4(args.model, args.out)

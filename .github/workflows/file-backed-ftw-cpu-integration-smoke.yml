@@ -19,6 +19,7 @@ on:
       - "tests/checkpoint/test_file_backed_ftw_cpu_server.py"
       - "tests/checkpoint/test_ftw_resource_gate.py"
       - "tests/checkpoint/test_low_memory_ftw_cpu_convert.py"
+      - "tests/checkpoint/test_low_memory_ftw_converter_provider.py"
       - ".github/workflows/file-backed-ftw-cpu-integration-smoke.yml"
 
 permissions:
@@ -50,6 +51,7 @@ jobs:
             python/freetoken/checkpoint/file_backed_ftw_cpu.py \
             python/freetoken/experimental/file_backed_ftw_cpu_server.py \
             python/freetoken/experimental/ftw_resource_gate.py \
+            python/freetoken/experimental/low_memory_ftw_converter.py \
             python/freetoken/experimental/low_memory_ftw_cpu_convert.py \
             tests/models/test_nvfp4_low_memory_stream.py \
             tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py \
@@ -59,7 +61,8 @@ jobs:
             tests/checkpoint/test_mapped_ftw.py \
             tests/checkpoint/test_file_backed_ftw_cpu_server.py \
             tests/checkpoint/test_ftw_resource_gate.py \
-            tests/checkpoint/test_low_memory_ftw_cpu_convert.py
+            tests/checkpoint/test_low_memory_ftw_cpu_convert.py \
+            tests/checkpoint/test_low_memory_ftw_converter_provider.py
           pytest -q \
             tests/models/test_nvfp4_low_memory_stream.py \
             tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py \
@@ -69,4 +72,5 @@ jobs:
             tests/checkpoint/test_mapped_ftw.py \
             tests/checkpoint/test_file_backed_ftw_cpu_server.py \
             tests/checkpoint/test_ftw_resource_gate.py \
-            tests/checkpoint/test_low_memory_ftw_cpu_convert.py
+            tests/checkpoint/test_low_memory_ftw_cpu_convert.py \
+            tests/checkpoint/test_low_memory_ftw_converter_provider.py

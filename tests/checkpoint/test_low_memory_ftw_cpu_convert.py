@@ -8,7 +8,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import torch
 
 ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_ROOT = ROOT / "python/freetoken"
@@ -38,126 +37,125 @@ CONVERT = _load(
 )
 
 
-class FakeWriter:
-    def __init__(self, out_dir: str, *, shard_limit: int):
-        self.out_dir = Path(out_dir)
-        self.out_dir.mkdir(parents=True, exist_ok=False)
-        self.shard_limit = shard_limit
-        self.rows = []
-        self._f = (self.out_dir / "freetoken-00000.ftw").open("wb")
-
-    def add_tensor(self, name, tensor, *, kind):
-        raw = bytes(tensor.detach().cpu().reshape(-1).view(torch.uint8).tolist())
-        self._f.write(raw)
-        self.rows.append((name, kind, len(raw)))
-
-    def finalize(self, meta):
-        self._f.close()
-        self._f = None
-        index = {
-            "format": "freetoken_weight",
-            "tensors": [
-                {"name": name, "kind": kind, "nbytes": nbytes}
-                for name, kind, nbytes in self.rows
-            ],
-            **meta,
+class FakeReport:
+    def as_dict(self):
+        return {
+            "source_shards": 1,
+            "source_tensor_bytes": 1234,
+            "expert_layer_bytes": 567,
         }
-        (self.out_dir / "freetoken_weight.json").write_text(
-            json.dumps(index), encoding="utf-8"
-        )
-        return index
 
 
 def _config():
     return SimpleNamespace(num_moe_layers=2)
 
 
-def _metadata_copier(_model_path: str, out_dir: str):
-    Path(out_dir, "config.json").write_text("{}", encoding="utf-8")
-    return ["config.json"]
-
-
-def _expert_streamer(model_path, model_config, spec, *, writer, drop_page_cache, alloc_layer):
-    assert model_path.endswith("source")
-    assert model_config.num_moe_layers == 2
-    assert spec == "synthetic-spec"
-    assert alloc_layer is None
-    drop_page_cache("synthetic-shard")
-    written = 0
-    nbytes = 0
-    for layer in range(2):
-        tensor = torch.tensor([layer + 10], dtype=torch.uint8)
-        writer.add_tensor(f"gate_up_packed#L{layer:05d}", tensor, kind="experts_bank")
-        written += 1
-        nbytes += tensor.numel() * tensor.element_size()
+def _good_index():
     return {
-        "layers_streamed": 2,
-        "ftw_entries_written": written,
-        "ftw_expert_bytes_written": nbytes,
-        "expert_bank_bytes_streamed": nbytes,
+        "format": "freetoken_weight",
+        "quant_format": "nvfp4",
+        "expert_bank_num_layers": 2,
+        "counts": {"weight": 3, "experts_bank": 12},
+        "fingerprint": "synthetic-fp",
     }
 
 
-def test_staged_writer_publishes_only_after_finalize(tmp_path):
+def test_staged_canonical_conversion_publishes_receipt_only_after_success(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     output = tmp_path / "result-ftw"
-    dropped = []
+    calls = []
 
-    index = CONVERT._write_native_nvfp4_ftw(
+    def fake_convert(model_path, out_dir, *, shard_limit, device):
+        calls.append((model_path, out_dir, shard_limit, device))
+        stage = Path(out_dir)
+        stage.mkdir(parents=True, exist_ok=False)
+        (stage / "freetoken_weight.json").write_text("{}", encoding="utf-8")
+        return _good_index()
+
+    index, receipt = CONVERT._atomic_staged_canonical_conversion(
         str(source),
         str(output),
-        _config(),
-        "synthetic-spec",
-        dense_weights=lambda: iter([
-            ("dense.weight", torch.tensor([1.0, 2.0], dtype=torch.float32)),
-        ]),
-        expert_streamer=_expert_streamer,
-        writer_factory=FakeWriter,
-        metadata_copier=_metadata_copier,
-        drop_page_cache=dropped.append,
-        fingerprint="synthetic-fp",
+        model_config=_config(),
+        preflight_report=FakeReport(),
+        convert_fn=fake_convert,
         shard_limit=4096,
+        device="cuda:0",
     )
 
+    assert index == _good_index()
     assert output.is_dir()
-    assert (output / "freetoken_weight.json").is_file()
-    assert (output / "config.json").is_file()
-    assert index["quant_format"] == "nvfp4"
-    assert index["expert_bank_num_layers"] == 2
-    assert index["conversion_target"] == "cpu_file_backed_native_nvfp4"
-    assert index["counts"] == {"weight": 1, "experts_bank": 2}
-    assert index["bytes"] == {"weight": 8, "experts_bank": 2}
-    assert dropped == ["synthetic-shard"]
+    receipt_path = output / CONVERT._RECEIPT_NAME
+    assert receipt_path.is_file()
+    on_disk = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert on_disk == receipt
+    assert receipt["conversion_target"] == "cpu_file_backed_native_nvfp4"
+    assert receipt["quant_format"] == "nvfp4"
+    assert receipt["expert_bank_num_layers"] == 2
+    assert receipt["device"] == "cuda:0"
+    assert calls[0][2:] == (4096, "cuda:0")
     assert not list(tmp_path.glob(".result-ftw.partial-*"))
 
 
-def test_failed_staged_conversion_never_publishes_and_cleans_partial(tmp_path):
+def test_failed_canonical_conversion_never_publishes_and_cleans_partial(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
     output = tmp_path / "result-ftw"
 
-    def fail_streamer(*args, writer, **kwargs):
-        writer.add_tensor("partial#L00000", torch.tensor([1], dtype=torch.uint8), kind="experts_bank")
-        raise RuntimeError("synthetic expert failure")
+    def fail_convert(_model_path, out_dir, **_kwargs):
+        stage = Path(out_dir)
+        stage.mkdir(parents=True, exist_ok=False)
+        (stage / "partial.ftw").write_bytes(b"partial")
+        raise RuntimeError("synthetic canonical conversion failure")
 
-    with pytest.raises(RuntimeError, match="synthetic expert failure"):
-        CONVERT._write_native_nvfp4_ftw(
+    with pytest.raises(RuntimeError, match="synthetic canonical conversion failure"):
+        CONVERT._atomic_staged_canonical_conversion(
             str(source),
             str(output),
-            _config(),
-            "synthetic-spec",
-            dense_weights=lambda: iter([]),
-            expert_streamer=fail_streamer,
-            writer_factory=FakeWriter,
-            metadata_copier=_metadata_copier,
-            drop_page_cache=lambda _path: None,
-            fingerprint=None,
+            model_config=_config(),
+            preflight_report=FakeReport(),
+            convert_fn=fail_convert,
             shard_limit=4096,
+            device="cuda:0",
         )
 
     assert not output.exists()
     assert not list(tmp_path.glob(".result-ftw.partial-*"))
+
+
+def test_bad_canonical_index_is_not_published(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+
+    def run_with(index, output):
+        def fake_convert(_model_path, out_dir, **_kwargs):
+            Path(out_dir).mkdir(parents=True, exist_ok=False)
+            return index
+
+        return CONVERT._atomic_staged_canonical_conversion(
+            str(source),
+            str(output),
+            model_config=_config(),
+            preflight_report=FakeReport(),
+            convert_fn=fake_convert,
+            shard_limit=4096,
+            device="cuda:0",
+        )
+
+    wrong_quant = tmp_path / "wrong-quant"
+    with pytest.raises(RuntimeError, match="unexpected quant_format"):
+        run_with({**_good_index(), "quant_format": "nvfp4_marlin"}, wrong_quant)
+    assert not wrong_quant.exists()
+
+    wrong_layers = tmp_path / "wrong-layers"
+    with pytest.raises(RuntimeError, match="wrote 1 expert layers"):
+        run_with({**_good_index(), "expert_bank_num_layers": 1}, wrong_layers)
+    assert not wrong_layers.exists()
+
+    no_experts = tmp_path / "no-experts"
+    with pytest.raises(RuntimeError, match="no expert-bank entries"):
+        run_with({**_good_index(), "counts": {"weight": 3, "experts_bank": 0}}, no_experts)
+    assert not no_experts.exists()
 
 
 def test_execute_refuses_existing_output_even_when_empty(tmp_path):
@@ -167,14 +165,14 @@ def test_execute_refuses_existing_output_even_when_empty(tmp_path):
     output.mkdir()
 
     with pytest.raises(ValueError, match="non-existing output path"):
-        CONVERT._write_native_nvfp4_ftw(
-            str(source), str(output), _config(), "synthetic-spec",
-            dense_weights=lambda: iter([]),
-            expert_streamer=_expert_streamer,
-            writer_factory=FakeWriter,
-            metadata_copier=_metadata_copier,
-            drop_page_cache=lambda _path: None,
-            fingerprint=None,
+        CONVERT._atomic_staged_canonical_conversion(
+            str(source),
+            str(output),
+            model_config=_config(),
+            preflight_report=FakeReport(),
+            convert_fn=lambda *_args, **_kwargs: _good_index(),
+            shard_limit=4096,
+            device="cuda:0",
         )
 
 
@@ -185,6 +183,7 @@ def test_cli_is_preflight_by_default_and_execute_is_explicit():
     assert preflight.execute is False
     assert execute.execute is True
     assert preflight.shard_limit_gib == 8.0
+    assert preflight.device == "cuda:0"
 
 
 def test_lightweight_preflight_config_accepts_pure_and_mixed_nvfp4_without_runtime_imports():
