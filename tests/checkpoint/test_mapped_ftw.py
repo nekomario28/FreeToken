@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import importlib.util
 import json
 import sys
@@ -150,20 +151,7 @@ def test_generic_entry_adapter_checks_shape_dtype_nbytes(tmp_path):
         MAPPED.map_ftw_entry(tmp_path, "x")
 
 
-def test_exact_offload_cache_accepts_file_backed_sources_as_cpu_pageable(tmp_path):
-    native_nvfp4 = [
-        "gate_up_packed", "gate_up_scale", "gate_up_global",
-        "down_packed", "down_scale", "down_global",
-    ]
-    _write_fixture(tmp_path, native_nvfp4)
-    bundle = MAPPED.map_ftw_expert_sources(
-        tmp_path,
-        2,
-        expected_banks=set(native_nvfp4),
-        expected_quant_format="nvfp4",
-        num_experts=2,
-    )
-
+def _make_exact_offload_cache():
     class _Logger:
         def __getattr__(self, _name):
             return lambda *_args, **_kwargs: None
@@ -200,12 +188,42 @@ def test_exact_offload_cache_accepts_file_backed_sources_as_cpu_pageable(tmp_pat
         decode_target="cpu",
     )
     cache.cpu_layer_ids = frozenset({0, 1})
-    cache.set_bank_sources(bundle.sources, bundle.layer_residency)
+    return cache
+
+
+def test_explicit_cache_attach_accepts_pageable_sources_and_anchors_owners(tmp_path):
+    native_nvfp4 = [
+        "gate_up_packed", "gate_up_scale", "gate_up_global",
+        "down_packed", "down_scale", "down_global",
+    ]
+    _write_fixture(tmp_path, native_nvfp4)
+    cache = _make_exact_offload_cache()
+    bundle = MAPPED.attach_file_backed_ftw_sources(cache, tmp_path)
 
     assert cache.layer_residency == ["pageable", "pageable"]
     assert cache._unpinned_layers == frozenset({0, 1})
     assert set(cache.bank_sources) == set(native_nvfp4)
     assert len(cache.banks) == len(native_nvfp4)
-    for name in native_nvfp4:
-        assert len(cache.bank_sources[name]) == 2
-        assert cache.bank_sources[name][0].data_ptr() == bundle.sources[name][0].data_ptr()
+    assert len(cache._file_backed_ftw_owners) == 12
+    first_ptr = bundle.sources["gate_up_packed"][0].data_ptr()
+    del bundle
+    gc.collect()
+    assert cache.bank_sources["gate_up_packed"][0].data_ptr() == first_ptr
+    assert all(not owner.mapping.closed for owner in cache._file_backed_ftw_owners)
+
+
+def test_explicit_cache_attach_rejects_partial_cpu_or_overlap(tmp_path):
+    native_nvfp4 = [
+        "gate_up_packed", "gate_up_scale", "gate_up_global",
+        "down_packed", "down_scale", "down_global",
+    ]
+    _write_fixture(tmp_path, native_nvfp4)
+    cache = _make_exact_offload_cache()
+    cache.cpu_layer_ids = frozenset({0})
+    with pytest.raises(ValueError, match="every MoE layer"):
+        MAPPED.attach_file_backed_ftw_sources(cache, tmp_path)
+
+    cache = _make_exact_offload_cache()
+    cache.prefill_overlap = True
+    with pytest.raises(ValueError, match="prefill overlap"):
+        MAPPED.attach_file_backed_ftw_sources(cache, tmp_path)
