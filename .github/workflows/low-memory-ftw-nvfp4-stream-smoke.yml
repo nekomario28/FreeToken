@@ -6,6 +6,7 @@ on:
       - work/low-memory-ftw-nvfp4-stream-20260826
       - work/file-backed-ftw-cpu-native-convert-20260826
       - work/low-memory-ftw-dense-envelope-20260826
+      - work/file-backed-ftw-cpu-convert-no-gpu-20260826
     paths:
       - "python/freetoken/checkpoint/low_memory_nvfp4.py"
       - "python/freetoken/checkpoint/ftw_filebacked.py"
