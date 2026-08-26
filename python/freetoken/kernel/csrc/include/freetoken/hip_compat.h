@@ -97,9 +97,7 @@
 #endif
 
 #ifndef cudaDevAttrCanUseHostPointerForRegisteredMem
-// HIP does not expose this attribute; assume UVA identity on ROCm (true on Linux).
-// TODO(ROCm): re-enable proper UVA query if HIP adds this attribute.
-#define cudaDevAttrCanUseHostPointerForRegisteredMem hipDeviceAttributeUnifiedAddressing
+#define cudaDevAttrCanUseHostPointerForRegisteredMem hipDeviceAttributeCanUseHostPointerForRegisteredMem
 #endif
 
 #ifndef cudaFuncSetAttribute
