@@ -17,9 +17,11 @@ requires a separate resource/admission decision before checkpoint payload is rea
 from __future__ import annotations
 
 from contextlib import contextmanager
+import threading
 from typing import Any, Callable
 
 _QWEN35_ARCH = "Qwen3_5MoeForConditionalGeneration"
+_EXPERT_LOADER_PATCH_LOCK = threading.RLock()
 
 
 def _architecture(model_config) -> str | None:
@@ -103,13 +105,27 @@ def _make_low_memory_native_nvfp4_loader(
 
 @contextmanager
 def _temporary_expert_loader(module: Any, loader: Callable[..., Any]):
-    """Patch one module attribute for exactly one conversion call and always restore it."""
-    original = module.load_expert_banks
-    module.load_expert_banks = loader
-    try:
-        yield
-    finally:
-        module.load_expert_banks = original
+    """Scope the experimental loader to the calling thread and always restore it.
+
+    ``convert_checkpoint`` imports ``load_expert_banks`` from the module at call time. A
+    plain process-global monkeypatch could therefore hijack unrelated serving/conversion
+    work in another thread. The dispatcher routes only the owner thread to the experimental
+    loader; every other thread continues to call the original. Experimental conversion
+    contexts are serialized so two dispatchers cannot stack.
+    """
+    with _EXPERT_LOADER_PATCH_LOCK:
+        original = module.load_expert_banks
+        owner_thread = threading.get_ident()
+
+        def scoped_loader(*args, **kwargs):
+            target = loader if threading.get_ident() == owner_thread else original
+            return target(*args, **kwargs)
+
+        module.load_expert_banks = scoped_loader
+        try:
+            yield
+        finally:
+            module.load_expert_banks = original
 
 
 def _require_metadata_preflight(
