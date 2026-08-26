@@ -4,11 +4,16 @@ on:
   push:
     branches:
       - work/low-memory-ftw-nvfp4-stream-20260826
+      - work/ftw-filebacked-runtime-integration-20260826
     paths:
       - "python/freetoken/checkpoint/low_memory_nvfp4.py"
       - "python/freetoken/checkpoint/ftw_filebacked.py"
+      - "python/freetoken/checkpoint/mapped_ftw.py"
+      - "python/freetoken/checkpoint/mapped_ftw_core.py"
       - "tests/models/test_nvfp4_low_memory_stream.py"
       - "tests/models/test_ftw_filebacked.py"
+      - "tests/checkpoint/test_mapped_ftw.py"
+      - "tests/checkpoint/test_mapped_ftw_core_stdlib.py"
       - ".github/workflows/low-memory-ftw-nvfp4-stream-smoke.yml"
 
 permissions:
@@ -36,6 +41,14 @@ jobs:
           python -m py_compile \
             python/freetoken/checkpoint/low_memory_nvfp4.py \
             python/freetoken/checkpoint/ftw_filebacked.py \
+            python/freetoken/checkpoint/mapped_ftw.py \
+            python/freetoken/checkpoint/mapped_ftw_core.py \
             tests/models/test_nvfp4_low_memory_stream.py \
-            tests/models/test_ftw_filebacked.py
-          pytest -q tests/models/test_nvfp4_low_memory_stream.py tests/models/test_ftw_filebacked.py
+            tests/models/test_ftw_filebacked.py \
+            tests/checkpoint/test_mapped_ftw.py \
+            tests/checkpoint/test_mapped_ftw_core_stdlib.py
+          pytest -q \
+            tests/models/test_nvfp4_low_memory_stream.py \
+            tests/models/test_ftw_filebacked.py \
+            tests/checkpoint/test_mapped_ftw.py \
+            tests/checkpoint/test_mapped_ftw_core_stdlib.py
