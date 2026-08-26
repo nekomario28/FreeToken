@@ -1166,6 +1166,14 @@ def _cpu_moe_executor_viable(model_config) -> bool:
         return False
     expert_quant = getattr(model_config, "expert_quant", "none")
     fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+    if fmt == "gguf":
+        from freetoken.moe.cpu_executor import _GGML_TO_CPU_FMT
+
+        types = getattr(model_config, "gguf_expert_types", None)
+        if not types:
+            return False
+        gate_up, down = int(types[0]), int(types[1])
+        return gate_up == down and gate_up in _GGML_TO_CPU_FMT
     return fmt == "mxfp4" or fmt in _WFMT_IDS
 
 
