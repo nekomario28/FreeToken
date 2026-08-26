@@ -40,9 +40,11 @@ import triton
 import triton.language as tl
 
 BLOCK_H = 16
-# The gather has exactly ONE tl.load site (the pool base is selected per column), so it stages
+# CUDA keeps exactly ONE tl.load site (the pool base is selected per column), so it stages
 # a single [BLOCK_T, D] KV tile -- 67968 B at BLOCK_T=32, num_stages=2, which fits the ~99KB
 # consumer-Blackwell (sm_120, e.g. RTX 5090) budget. (BLOCK_T=64 would need ~103KB.)
+# ROCm uses separately masked pool loads because AMD Triton can assert while canonicalizing
+# a pointer-valued select between the two pool bases (triton-lang/triton#9859).
 BLOCK_T = 32
 MAX_SPLITS = 32
 MIN_TILES_PER_SPLIT = 4
@@ -63,6 +65,7 @@ def _sparse_attn_paged_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
+    SEPARATE_POOL_LOADS: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
     pid_b = tl.program_id(1)
@@ -99,9 +102,19 @@ def _sparse_attn_paged_kernel(
         # multiple KV tiles in shared memory. Result is bit-identical to the two-pool form -- each
         # column still reads from the same pool/slot.
         is_win = offs_t < N_WINDOW
-        base = tl.where(is_win, win_ptr, cmp_ptr)  # [BLOCK_T] per-column pool base pointer
-        kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
-        kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)  # [BLOCK_T, D]
+        if SEPARATE_POOL_LOADS:
+            # Avoid a pointer-valued select on ROCm; see triton-lang/triton#9859.
+            win_ptrs = win_ptr + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
+            cmp_ptrs = cmp_ptr + idxs[:, None] * stride_cn + offs_d[None, :] * stride_cd
+            win_valid = valid & is_win
+            cmp_valid = valid & ~is_win
+            win_kv = tl.load(win_ptrs, mask=win_valid[:, None], other=0.0)
+            cmp_kv = tl.load(cmp_ptrs, mask=cmp_valid[:, None], other=0.0)
+            kv = (win_kv + cmp_kv).to(tl.float32)
+        else:
+            base = tl.where(is_win, win_ptr, cmp_ptr)  # [BLOCK_T] per-column pool base pointer
+            kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
+            kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)  # [BLOCK_T, D]
 
         scores = tl.dot(q, tl.trans(kv)) * scale  # [BLOCK_H, BLOCK_T]
         scores = tl.where(valid[None, :], scores, -float("inf"))
@@ -140,6 +153,7 @@ def _sparse_attn_paged_splitk_kernel(
     BLOCK_H: tl.constexpr,
     BLOCK_T: tl.constexpr,
     HAS_COUNTS: tl.constexpr,
+    SEPARATE_POOL_LOADS: tl.constexpr,
     NUM_SPLITS: tl.constexpr,
 ):
     """Stage 1: each program reduces one BLOCK_T-aligned slice of the candidate list and writes
@@ -182,9 +196,19 @@ def _sparse_attn_paged_splitk_kernel(
             idxs = tl.load(idx_base + offs_t * stride_it, mask=t_mask, other=-1)
             valid = idxs >= 0
             is_win = offs_t < N_WINDOW
-            base = tl.where(is_win, win_ptr, cmp_ptr)
-            kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
-            kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
+            if SEPARATE_POOL_LOADS:
+                # Avoid a pointer-valued select on ROCm; see triton-lang/triton#9859.
+                win_ptrs = win_ptr + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
+                cmp_ptrs = cmp_ptr + idxs[:, None] * stride_cn + offs_d[None, :] * stride_cd
+                win_valid = valid & is_win
+                cmp_valid = valid & ~is_win
+                win_kv = tl.load(win_ptrs, mask=win_valid[:, None], other=0.0)
+                cmp_kv = tl.load(cmp_ptrs, mask=cmp_valid[:, None], other=0.0)
+                kv = (win_kv + cmp_kv).to(tl.float32)
+            else:
+                base = tl.where(is_win, win_ptr, cmp_ptr)
+                kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd
+                kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
 
             scores = tl.dot(q, tl.trans(kv)) * scale
             scores = tl.where(valid[None, :], scores, -float("inf"))
@@ -345,6 +369,7 @@ def sparse_attn_paged(
         BLOCK_H=BLOCK_H,
         BLOCK_T=BLOCK_T,
         HAS_COUNTS=has_counts,
+        SEPARATE_POOL_LOADS=torch.version.hip is not None,
         num_warps=8,
         num_stages=2,
     )
@@ -374,6 +399,7 @@ def _sparse_attn_paged_splitk(
         BLOCK_H=BLOCK_H,
         BLOCK_T=BLOCK_T,
         HAS_COUNTS=has_counts,
+        SEPARATE_POOL_LOADS=torch.version.hip is not None,
         NUM_SPLITS=n_splits,
         num_warps=8,
         num_stages=2,
