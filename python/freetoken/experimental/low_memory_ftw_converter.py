@@ -1,16 +1,20 @@
 """Converter-only native-NVFP4 provider for the low-memory FTW experiment.
 
-The canonical ``ft checkpoint`` path is not modified. This module supplies a bounded adapter
-with the same call shape as ``freetoken.moe.expert_banks.load_expert_banks`` and installs it
-only for one canonical conversion call. The dispatcher is owner-thread scoped: unrelated
-threads continue to use the original loader while the experiment runs.
+The canonical ``ft checkpoint`` path is not modified. This module supplies an adapter with
+the same call shape as ``freetoken.moe.expert_banks.load_expert_banks`` and installs it only
+for one canonical conversion call. The dispatcher is owner-thread scoped: unrelated threads
+continue to use the original loader while the experiment runs.
+
+The default experimental path is now fragment-streamed rather than layer-materialized:
+source NVFP4 expert tensors are file-backed views and are written into the canonical FTW
+sink in final bank order without allocating six full [E, ...] banks for a layer.
 
 The path is deliberately narrow and fail-closed:
 
 * Qwen3.5 ModelOpt NVFP4 MoE only;
 * canonical converter ``layer_sink`` required;
 * no dummy banks or serving residency plan;
-* strict one-layer serial expert scheduling;
+* strict serial fragment scheduling;
 * native ``nvfp4`` bundle only;
 * complete streamed layer count required before a streamed bundle is returned.
 """
@@ -48,16 +52,14 @@ def _source_spec_for_model(model_config):
     return module._NVFP4_SOURCE_SPEC
 
 
-def _stream_one_layer_at_a_time(model_path: str, model_config, source_spec, layer_sink) -> dict:
-    from freetoken.checkpoint.low_memory_nvfp4 import stream_nvfp4_layers_serial
-    from freetoken.models.loader import drop_page_cache
+def _stream_fragments(model_path: str, model_config, source_spec, layer_sink) -> dict:
+    from freetoken.experimental.ftw_fragment_stream import stream_nvfp4_fragments_serial
 
-    return stream_nvfp4_layers_serial(
+    return stream_nvfp4_fragments_serial(
         model_path,
         model_config,
         source_spec,
-        drop_page_cache=drop_page_cache,
-        layer_sink=layer_sink,
+        layer_sink,
     )
 
 
@@ -65,9 +67,13 @@ def _make_low_memory_loader(
     expert_banks_cls,
     *,
     source_spec_for_model: Callable[[Any], Any] = _source_spec_for_model,
-    stream_one_layer: Callable[[str, Any, Any, Any], dict] = _stream_one_layer_at_a_time,
+    stream_one_layer: Callable[[str, Any, Any, Any], dict] = _stream_fragments,
 ):
-    """Build the canonical ``load_expert_banks``-shape converter adapter."""
+    """Build the canonical ``load_expert_banks``-shape converter adapter.
+
+    ``stream_one_layer`` keeps its historical injection name for compatibility with the
+    synthetic provider tests; the production default is fragment-streamed.
+    """
 
     def load_expert_banks(
         model_path,
@@ -91,7 +97,7 @@ def _make_low_memory_loader(
         if layer_residency is not None:
             raise ValueError("low-memory FTW conversion does not accept a serving residency plan")
         if parallel not in (None, False):
-            raise ValueError("low-memory FTW conversion owns serial one-layer source scheduling")
+            raise ValueError("low-memory FTW conversion owns serial fragment source scheduling")
 
         source_spec = source_spec_for_model(model_config)
         stats = stream_one_layer(model_path, model_config, source_spec, layer_sink)
@@ -113,14 +119,7 @@ def _make_low_memory_loader(
 
 @contextmanager
 def _patched_expert_loader(expert_banks_mod=None) -> Iterator[Callable[..., Any]]:
-    """Install an owner-thread-scoped converter provider and always restore the original.
-
-    ``convert_checkpoint`` imports ``load_expert_banks`` at call time. A plain global
-    monkeypatch could therefore hijack unrelated serving/conversion work in another thread.
-    This dispatcher routes only the thread that entered the context to the experimental
-    loader; all other threads keep using the original. Contexts are serialized so dispatchers
-    cannot stack over each other.
-    """
+    """Install an owner-thread-scoped converter provider and always restore the original."""
     if expert_banks_mod is None:
         import freetoken.moe.expert_banks as expert_banks_mod
 
@@ -151,7 +150,7 @@ def convert_checkpoint_low_memory_nvfp4(
     _convert_fn: Callable[..., Any] | None = None,
     _expert_banks_mod=None,
 ):
-    """Run canonical FTW conversion with the bounded native-NVFP4 expert provider."""
+    """Run canonical FTW conversion with the fragment-streamed native-NVFP4 provider."""
     if moe_backend != "offload":
         raise ValueError("low-memory FTW conversion requires moe_backend='offload'")
 

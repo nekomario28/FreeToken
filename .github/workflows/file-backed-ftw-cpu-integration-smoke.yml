@@ -18,6 +18,7 @@ on:
       - "tests/checkpoint/test_mapped_ftw.py"
       - "tests/checkpoint/test_file_backed_ftw_cpu_server.py"
       - "tests/checkpoint/test_dense_conversion_envelope.py"
+      - "tests/checkpoint/test_ftw_fragment_stream.py"
       - "tests/checkpoint/test_ftw_resource_gate.py"
       - "tests/checkpoint/test_low_memory_ftw_cpu_convert.py"
       - "tests/checkpoint/test_low_memory_ftw_converter_provider.py"
@@ -52,6 +53,7 @@ jobs:
             python/freetoken/checkpoint/file_backed_ftw_cpu.py \
             python/freetoken/experimental/file_backed_ftw_cpu_server.py \
             python/freetoken/experimental/dense_conversion_envelope.py \
+            python/freetoken/experimental/ftw_fragment_stream.py \
             python/freetoken/experimental/ftw_resource_gate.py \
             python/freetoken/experimental/low_memory_ftw_converter.py \
             python/freetoken/experimental/low_memory_ftw_cpu_convert.py \
@@ -63,6 +65,7 @@ jobs:
             tests/checkpoint/test_mapped_ftw.py \
             tests/checkpoint/test_file_backed_ftw_cpu_server.py \
             tests/checkpoint/test_dense_conversion_envelope.py \
+            tests/checkpoint/test_ftw_fragment_stream.py \
             tests/checkpoint/test_ftw_resource_gate.py \
             tests/checkpoint/test_low_memory_ftw_cpu_convert.py \
             tests/checkpoint/test_low_memory_ftw_converter_provider.py
@@ -75,6 +78,7 @@ jobs:
             tests/checkpoint/test_mapped_ftw.py \
             tests/checkpoint/test_file_backed_ftw_cpu_server.py \
             tests/checkpoint/test_dense_conversion_envelope.py \
+            tests/checkpoint/test_ftw_fragment_stream.py \
             tests/checkpoint/test_ftw_resource_gate.py \
             tests/checkpoint/test_low_memory_ftw_cpu_convert.py \
             tests/checkpoint/test_low_memory_ftw_converter_provider.py
