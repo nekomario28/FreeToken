@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,8 +15,12 @@ assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
 make_loader = MODULE._make_low_memory_native_nvfp4_loader
+make_dense_writer = MODULE._make_dense_passthrough_writer
+resolve_embedding = MODULE._resolve_embedding_passthrough
 temporary_loader = MODULE._temporary_expert_loader
 temporary_cpu_device = MODULE._temporary_cpu_conversion_device
+temporary_safe_open_skip = MODULE._temporary_safetensors_tensor_skip
+temporary_ftw_writer = MODULE._temporary_ftw_writer
 require_preflight = MODULE._require_metadata_preflight
 
 
@@ -160,15 +165,11 @@ def test_cpu_conversion_device_shim_is_owner_thread_only_and_preserves_cuda_call
     owner = threading.get_ident()
 
     with temporary_cpu_device(fake_torch):
-        # The one special case: owner-thread CPU conversion skips cuda.set_device(cpu).
         assert fake_torch.cuda.set_device("cpu") is None
         assert calls == []
-
-        # Owner-thread CUDA behavior remains canonical.
         assert fake_torch.cuda.set_device("cuda:0") == "original"
         assert calls == [(owner, "cuda:0")]
 
-        # Another thread never inherits the CPU exception.
         other = []
         thread = threading.Thread(target=lambda: other.append(fake_torch.cuda.set_device("cpu")))
         thread.start()
@@ -177,7 +178,6 @@ def test_cpu_conversion_device_shim_is_owner_thread_only_and_preserves_cuda_call
         assert calls[-1][1] == "cpu"
         assert calls[-1][0] != owner
 
-    # Restoration must hold even though the saved object is a bound method.
     assert fake_torch.cuda.set_device.__func__ is original.__func__
 
 
@@ -197,6 +197,176 @@ def test_cpu_conversion_device_shim_restores_after_failure():
             assert fake_torch.cuda.set_device("cpu") is None
             raise RuntimeError("boom")
     assert fake_torch.cuda.set_device.__func__ is original.__func__
+
+
+def test_embedding_passthrough_resolver_accepts_only_one_plain_bf16_source(tmp_path: Path):
+    raw_name = "model.language_model.embed_tokens.weight"
+    shard = tmp_path / "model-00001-of-00002.safetensors"
+    shard.write_bytes(b"synthetic")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {raw_name: shard.name}}), encoding="utf-8"
+    )
+
+    calls = []
+
+    def tensor_entry(path, name):
+        calls.append((Path(path).name, name))
+        if name != raw_name:
+            raise KeyError(name)
+        return 128, 123456, "bfloat16", [32000, 2048]
+
+    result = resolve_embedding(str(tmp_path), tensor_entry_fn=tensor_entry)
+    assert result["name"] == "model.embed_tokens.weight"
+    assert result["raw_name"] == raw_name
+    assert result["payload_bytes"] == 123456
+    assert result["dtype"] == "bfloat16"
+    assert result["shape"] == [32000, 2048]
+    assert Path(result["source_path"]) == shard.resolve()
+    assert calls == [(shard.name, raw_name)]
+
+
+def test_embedding_passthrough_resolver_rejects_quantized_and_ambiguous_sources(tmp_path: Path):
+    raw_a = "model.language_model.embed_tokens.weight"
+    raw_b = "language_model.embed_tokens.weight"
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"synthetic")
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {raw_a: shard.name, raw_a[:-7] + ".weight_scale": shard.name}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="quantized/scaled"):
+        resolve_embedding(
+            str(tmp_path), tensor_entry_fn=lambda *_args: (0, 1, "bfloat16", [1, 1])
+        )
+
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {raw_a: shard.name, raw_b: shard.name}}), encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="exactly one"):
+        resolve_embedding(
+            str(tmp_path), tensor_entry_fn=lambda *_args: (0, 1, "bfloat16", [1, 1])
+        )
+
+
+def test_embedding_passthrough_resolver_rejects_non_bf16_or_wrong_shape(tmp_path: Path):
+    raw_name = "model.language_model.embed_tokens.weight"
+    shard = tmp_path / "model.safetensors"
+    shard.write_bytes(b"synthetic")
+    (tmp_path / "model.safetensors.index.json").write_text(
+        json.dumps({"weight_map": {raw_name: shard.name}}), encoding="utf-8"
+    )
+
+    with pytest.raises(ValueError, match="requires BF16"):
+        resolve_embedding(
+            str(tmp_path), tensor_entry_fn=lambda *_args: (0, 8, "float16", [2, 2])
+        )
+    with pytest.raises(ValueError, match="rank-2"):
+        resolve_embedding(
+            str(tmp_path), tensor_entry_fn=lambda *_args: (0, 8, "bfloat16", [4])
+        )
+
+
+def test_safe_open_skip_hides_tensor_only_from_owner_and_restores():
+    calls = []
+
+    class Handle:
+        def keys(self):
+            return ["keep", "hidden"]
+
+        def get_tensor(self, name):
+            calls.append((threading.get_ident(), name))
+            return f"tensor:{name}"
+
+    class Context:
+        def __enter__(self):
+            return Handle()
+
+        def __exit__(self, *_args):
+            return False
+
+    class SafeModule:
+        def safe_open(self, path, *args, **kwargs):
+            del path, args, kwargs
+            return Context()
+
+    module = SafeModule()
+    original = module.safe_open
+    with temporary_safe_open_skip(module, source_path="/tmp/source.safetensors", raw_name="hidden"):
+        with module.safe_open("/tmp/source.safetensors") as handle:
+            assert handle.keys() == ["keep"]
+            assert handle.get_tensor("keep") == "tensor:keep"
+            with pytest.raises(RuntimeError, match="must not be materialized"):
+                handle.get_tensor("hidden")
+
+        other = []
+
+        def other_thread():
+            with module.safe_open("/tmp/source.safetensors") as handle:
+                other.append((handle.keys(), handle.get_tensor("hidden")))
+
+        thread = threading.Thread(target=other_thread)
+        thread.start()
+        thread.join()
+        assert other == [(["keep", "hidden"], "tensor:hidden")]
+
+    assert module.safe_open.__func__ is original.__func__
+
+
+def test_dense_passthrough_writer_appends_once_and_corrects_counts():
+    target = {
+        "name": "model.embed_tokens.weight",
+        "raw_name": "model.language_model.embed_tokens.weight",
+        "source_path": "/tmp/source.safetensors",
+    }
+
+    class FakeWriter:
+        def __init__(self):
+            self._tensors = []
+            self.calls = []
+
+        def add_safetensors_passthrough(self, **kwargs):
+            self.calls.append(kwargs)
+            self._tensors.append({"name": kwargs["name"]})
+            return {"payload_bytes": 1234, "max_read_buffer_bytes": 4096}
+
+        def finalize(self, meta):
+            return meta
+
+    Writer = make_dense_writer(FakeWriter, target, chunk_bytes=4096)
+    writer = Writer()
+    result = writer.finalize({"counts": {"weight": 7, "experts_bank": 4}})
+    assert result["counts"] == {"weight": 8, "experts_bank": 4}
+    assert result["dense_passthrough"] == {
+        "name": target["name"],
+        "raw_name": target["raw_name"],
+        "payload_bytes": 1234,
+        "max_read_buffer_bytes": 4096,
+    }
+    assert writer.calls[0]["chunk_bytes"] == 4096
+
+    duplicate = Writer()
+    duplicate._tensors.append({"name": target["name"]})
+    with pytest.raises(RuntimeError, match="already exists"):
+        duplicate.finalize({"counts": {"weight": 1}})
+
+
+def test_temporary_ftw_writer_is_owner_scoped_and_restored():
+    class Original:
+        pass
+
+    class Replacement:
+        pass
+
+    module = SimpleNamespace(FTWWriter=Original)
+    with temporary_ftw_writer(module, Replacement):
+        assert isinstance(module.FTWWriter(), Replacement)
+        other = []
+        thread = threading.Thread(target=lambda: other.append(type(module.FTWWriter())))
+        thread.start()
+        thread.join()
+        assert other == [Original]
+    assert module.FTWWriter is Original
 
 
 def test_metadata_preflight_blocks_before_conversion_contract_is_entered():
