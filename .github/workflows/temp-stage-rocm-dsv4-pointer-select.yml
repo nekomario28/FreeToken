@@ -1,0 +1,124 @@
+name: TEMP stage ROCm DSV4 pointer-select fix
+
+on:
+  push:
+    branches:
+      - tmp/stage-rocm-dsv4-pointer-select-20260826
+
+permissions:
+  contents: write
+
+jobs:
+  stage:
+    if: github.event.head_commit.message == 'ci: stage ROCm DSV4 pointer-select fix'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+
+      - name: Apply minimal backend-specialized source change
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD^)" = "c2bf6d3663e59c705c1bafcecdd5ee88b5c28975"
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('python/freetoken/kernel/triton/dsv4/sparse_attn.py')
+          lines = path.read_text().splitlines()
+          out = []
+          signature_args = 0
+          pointer_blocks = 0
+          launch_args = 0
+          top_comment = 0
+          i = 0
+          while i < len(lines):
+              line = lines[i]
+              stripped = line.strip()
+
+              if stripped.startswith('# The gather has exactly ONE tl.load site'):
+                  assert i + 2 < len(lines)
+                  assert 'single [BLOCK_T, D] KV tile' in lines[i + 1]
+                  assert 'consumer-Blackwell' in lines[i + 2]
+                  out.extend([
+                      '# CUDA keeps exactly ONE tl.load site (the pool base is selected per column), so it stages',
+                      '# a single [BLOCK_T, D] KV tile -- 67968 B at BLOCK_T=32, num_stages=2, which fits the ~99KB',
+                      '# consumer-Blackwell (sm_120, e.g. RTX 5090) budget. (BLOCK_T=64 would need ~103KB.)',
+                      '# ROCm uses separately masked pool loads because AMD Triton can assert while canonicalizing',
+                      '# a pointer-valued select between the two pool bases (triton-lang/triton#9859).',
+                  ])
+                  top_comment += 1
+                  i += 3
+                  continue
+
+              if stripped == 'HAS_COUNTS: tl.constexpr,':
+                  out.append(line)
+                  indent = line[: len(line) - len(line.lstrip())]
+                  out.append(indent + 'SEPARATE_POOL_LOADS: tl.constexpr,')
+                  signature_args += 1
+                  i += 1
+                  continue
+
+              if stripped.startswith('base = tl.where(is_win, win_ptr, cmp_ptr)'):
+                  assert i + 2 < len(lines)
+                  assert lines[i + 1].strip() == 'kv_ptrs = base[:, None] + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd'
+                  assert lines[i + 2].strip().startswith('kv = tl.load(kv_ptrs, mask=valid[:, None], other=0.0).to(tl.float32)')
+                  indent = line[: len(line) - len(line.lstrip())]
+                  inner = indent + '    '
+                  out.extend([
+                      indent + 'if SEPARATE_POOL_LOADS:',
+                      inner + '# Avoid a pointer-valued select on ROCm; see triton-lang/triton#9859.',
+                      inner + 'win_ptrs = win_ptr + idxs[:, None] * stride_wn + offs_d[None, :] * stride_wd',
+                      inner + 'cmp_ptrs = cmp_ptr + idxs[:, None] * stride_cn + offs_d[None, :] * stride_cd',
+                      inner + 'win_valid = valid & is_win',
+                      inner + 'cmp_valid = valid & ~is_win',
+                      inner + 'win_kv = tl.load(win_ptrs, mask=win_valid[:, None], other=0.0)',
+                      inner + 'cmp_kv = tl.load(cmp_ptrs, mask=cmp_valid[:, None], other=0.0)',
+                      inner + 'kv = (win_kv + cmp_kv).to(tl.float32)',
+                      indent + 'else:',
+                      inner + stripped,
+                      inner + lines[i + 1].strip(),
+                      inner + lines[i + 2].strip(),
+                  ])
+                  pointer_blocks += 1
+                  i += 3
+                  continue
+
+              if stripped == 'HAS_COUNTS=has_counts,':
+                  out.append(line)
+                  indent = line[: len(line) - len(line.lstrip())]
+                  out.append(indent + 'SEPARATE_POOL_LOADS=torch.version.hip is not None,')
+                  launch_args += 1
+                  i += 1
+                  continue
+
+              out.append(line)
+              i += 1
+
+          assert top_comment == 1, top_comment
+          assert signature_args == 2, signature_args
+          assert pointer_blocks == 2, pointer_blocks
+          assert launch_args == 2, launch_args
+          text = '\n'.join(out) + '\n'
+          assert text.count('SEPARATE_POOL_LOADS: tl.constexpr') == 2
+          assert text.count('SEPARATE_POOL_LOADS=torch.version.hip is not None') == 2
+          assert text.count('base = tl.where(is_win, win_ptr, cmp_ptr)') == 2
+          path.write_text(text)
+          PY
+          python -m py_compile python/freetoken/kernel/triton/dsv4/sparse_attn.py
+          git diff --check
+          git diff -- python/freetoken/kernel/triton/dsv4/sparse_attn.py
+
+      - name: Commit product-only tree and remove staging workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Yuu'
+          git config user.email '206304251+nekomario28@users.noreply.github.com'
+          git rm .github/workflows/temp-stage-rocm-dsv4-pointer-select.yml
+          git add python/freetoken/kernel/triton/dsv4/sparse_attn.py
+          git diff --cached --check
+          git commit -m 'fix(rocm): avoid pointer-select crash in DSV4 sparse attention'
+          git push origin HEAD:tmp/stage-rocm-dsv4-pointer-select-20260826
