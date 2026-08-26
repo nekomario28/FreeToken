@@ -11,7 +11,9 @@ on:
       - "python/freetoken/checkpoint/mapped_ftw.py"
       - "python/freetoken/checkpoint/file_backed_ftw_cpu.py"
       - "python/freetoken/experimental/file_backed_ftw_cpu_server.py"
+      - "python/freetoken/models/nvfp4_banks.py"
       - "tests/models/test_nvfp4_low_memory_stream.py"
+      - "tests/models/test_nvfp4_bounded_converter_adapter.py"
       - "tests/models/test_ftw_filebacked.py"
       - "tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py"
       - "tests/checkpoint/test_mapped_ftw_core_stdlib.py"
@@ -50,7 +52,9 @@ jobs:
             python/freetoken/checkpoint/mapped_ftw.py \
             python/freetoken/checkpoint/file_backed_ftw_cpu.py \
             python/freetoken/experimental/file_backed_ftw_cpu_server.py \
+            python/freetoken/models/nvfp4_banks.py \
             tests/models/test_nvfp4_low_memory_stream.py \
+            tests/models/test_nvfp4_bounded_converter_adapter.py \
             tests/models/test_ftw_filebacked.py \
             tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py \
             tests/checkpoint/test_mapped_ftw_core_stdlib.py \
@@ -60,6 +64,7 @@ jobs:
             tests/checkpoint/test_file_backed_ftw_cpu_server.py
           pytest -q \
             tests/models/test_nvfp4_low_memory_stream.py \
+            tests/models/test_nvfp4_bounded_converter_adapter.py \
             tests/models/test_ftw_filebacked.py \
             tests/checkpoint/test_low_memory_nvfp4_ftw_bridge.py \
             tests/checkpoint/test_mapped_ftw_core_stdlib.py \

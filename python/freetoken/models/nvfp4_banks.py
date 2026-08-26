@@ -62,6 +62,68 @@ def _alloc_nvfp4_host_banks(num_layers: int, E: int, H: int, I: int):
     }, num_layers)
 
 
+def _bounded_serial_nvfp4_sources(
+    model_path: str,
+    config,
+    spec: Nvfp4ExpertSourceSpec,
+    *,
+    drop_page_cache: DropPageCache,
+    layer_sink,
+) -> dict[str, list[torch.Tensor]]:
+    """Converter-only hard-bound path: allocate/fill/release exactly one MoE layer at a time.
+
+    The public loader ABI still returns ``dict[bank, list[Tensor]]``. Those tensor objects are
+    retained only as released source-shape placeholders after ``layer_sink`` has consumed the
+    layer; ``HostBank.release()`` drops their resident anonymous pages with ``MADV_DONTNEED``.
+    The converter checks ``ExpertBanks.streamed`` and never reads these released tensors.
+    """
+    from freetoken.checkpoint.low_memory_nvfp4 import stream_nvfp4_layers_serial
+
+    num_layers = _num_moe_layers(config)
+    sources: dict[str, list[torch.Tensor | None]] = {}
+
+    def _sink(layer_id: int, banks: dict) -> None:
+        names = set(banks)
+        if not sources:
+            sources.update({name: [None] * num_layers for name in sorted(names)})
+        elif names != set(sources):
+            raise AssertionError(
+                f"{spec.desc}: streamed layer {layer_id} banks {sorted(names)} "
+                f"differ from first layer {sorted(sources)}"
+            )
+
+        # Retain only the tensor view needed to preserve the historical loader ABI. The sink
+        # owns HostBank release; on a sink failure, drop every current-layer bank defensively.
+        refs = {name: bank.tensor for name, bank in banks.items()}
+        try:
+            layer_sink(layer_id, banks)
+        except BaseException:
+            for bank in banks.values():
+                bank.release()
+            raise
+        for name, tensor in refs.items():
+            sources[name][layer_id] = tensor
+
+    stats = stream_nvfp4_layers_serial(
+        model_path,
+        config,
+        spec,
+        drop_page_cache=drop_page_cache,
+        layer_sink=_sink,
+    )
+    if int(stats["layers_streamed"]) != num_layers:
+        raise AssertionError(
+            f"{spec.desc}: bounded streamer reported {stats['layers_streamed']} layers, "
+            f"expected {num_layers}"
+        )
+    if not sources or any(tensor is None for per_layer in sources.values() for tensor in per_layer):
+        raise AssertionError(f"{spec.desc}: bounded streamer returned an incomplete source geometry")
+    return {
+        name: [tensor for tensor in per_layer if tensor is not None]
+        for name, per_layer in sources.items()
+    }
+
+
 def load_nvfp4_expert_source_banks(
     model_path: str,
     config,
@@ -80,12 +142,23 @@ def load_nvfp4_expert_source_banks(
     fold the global into per-expert alphas; see moe/nvfp4_backends.py.)
 
     ``layer_sink=None`` (serving): pin each bank layer as its writes complete, via an
-    internally-owned :class:`PinPipeline`. ``layer_sink`` given (converter; for
-    marlin/b12x the provider wraps it in a per-layer repacking sink first): the
-    completion tracker fires into it instead -- nothing here is pinned, and the sink
-    may release banks it has written out, so the returned tensors are only valid
-    until then (the caller owns that tradeoff).
+    internally-owned :class:`PinPipeline`.
+
+    ``layer_sink`` given (converter; for marlin/b12x the provider wraps it in a per-layer
+    repacking sink first): use the hard-bounded serial converter path, which allocates and
+    fills exactly one MoE layer before handing it to the sink and releasing its resident
+    pages. The returned tensor lists preserve the loader ABI only; their released contents
+    must not be read after streaming.
     """
+    if layer_sink is not None:
+        return _bounded_serial_nvfp4_sources(
+            model_path,
+            config,
+            spec,
+            drop_page_cache=drop_page_cache,
+            layer_sink=layer_sink,
+        )
+
     folder = download_hf_weight(model_path)
     index_path = os.path.join(folder, "model.safetensors.index.json")
     with open(index_path, encoding="utf-8") as f:
@@ -183,11 +256,8 @@ def load_nvfp4_expert_source_banks(
             drop_page_cache(path)
         return placed
 
-    if layer_sink is not None:
-        placed = _load(layer_sink)
-    else:
-        with PinPipeline() as pins:
-            placed = _load(pins)
+    with PinPipeline() as pins:
+        placed = _load(pins)
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
@@ -212,10 +282,23 @@ def load_nvfp4_expert_source_banks_parallel(
     chunk: int = 8 << 20,
     layer_sink=None,
 ) -> dict[str, list[torch.Tensor]]:
-    """parallel counterpart of :func:`load_nvfp4_expert_source_banks`, byte-for-byte same
-    placement. bulk weight/weight_scale read via chunked multi-threaded O_DIRECT reader
-    (iter_expert_tensors_parallel); tiny globals (``weight_scale_2``) stay serial (negligible
-    bytes). ``layer_sink``: see :func:`load_nvfp4_expert_source_banks`."""
+    """parallel counterpart of :func:`load_nvfp4_expert_source_banks`.
+
+    Serving (``layer_sink=None``) keeps the chunked multi-threaded O_DIRECT reader. Converter
+    calls deliberately fall back to the hard-bounded serial path: the parallel reader retains
+    whole-shard anonymous prefetch buffers and therefore cannot provide the one-layer memory
+    bound that low-RAM FTW conversion requires.
+    """
+    if layer_sink is not None:
+        return load_nvfp4_expert_source_banks(
+            model_path,
+            config,
+            spec,
+            drop_page_cache=drop_page_cache,
+            primary=primary,
+            layer_sink=layer_sink,
+        )
+
     from freetoken.models.weight import iter_expert_tensors_parallel
 
     folder = download_hf_weight(model_path)
@@ -302,11 +385,8 @@ def load_nvfp4_expert_source_banks_parallel(
             placed += 1
         return placed
 
-    if layer_sink is not None:
-        placed = _load(layer_sink)
-    else:
-        with PinPipeline() as pins:
-            placed = _load(pins)
+    with PinPipeline() as pins:
+        placed = _load(pins)
 
     expected = num_layers * E * 6
     assert placed == expected, f"{spec.desc}: loaded {placed} expert tensors, expected {expected}"
