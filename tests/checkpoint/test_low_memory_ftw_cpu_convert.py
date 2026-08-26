@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.util
 import json
-import os
 import sys
 import types
 from pathlib import Path
@@ -186,3 +185,58 @@ def test_cli_is_preflight_by_default_and_execute_is_explicit():
     assert preflight.execute is False
     assert execute.execute is True
     assert preflight.shard_limit_gib == 8.0
+
+
+def test_lightweight_preflight_config_accepts_pure_and_mixed_nvfp4_without_runtime_imports():
+    pure = SimpleNamespace(
+        architectures=["Qwen3_5MoeForConditionalGeneration"],
+        quantization_config={"quant_algo": "NVFP4"},
+        num_experts=128,
+        hidden_size=2048,
+        moe_intermediate_size=768,
+        num_hidden_layers=40,
+    )
+    cfg = CONVERT._preflight_config_from_hf(pure)
+    assert (cfg.num_experts, cfg.hidden_size, cfg.moe_intermediate_size, cfg.num_moe_layers) == (
+        128, 2048, 768, 40
+    )
+
+    mixed = SimpleNamespace(
+        architectures=["Qwen3_5MoeForConditionalGeneration"],
+        text_config=SimpleNamespace(
+            num_experts=64,
+            hidden_size=1024,
+            moe_intermediate_size=512,
+            num_hidden_layers=24,
+        ),
+        quantization_config={
+            "quant_algo": "MIXED_PRECISION",
+            "quantized_layers": {
+                "model.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4"},
+                "model.layers.0.self_attn.q_proj": {"quant_algo": "FP8"},
+            },
+        },
+    )
+    mixed_cfg = CONVERT._preflight_config_from_hf(mixed)
+    assert mixed_cfg.expert_quant == "nvfp4"
+    assert mixed_cfg.num_moe_layers == 24
+
+
+def test_lightweight_preflight_config_fails_closed_on_arch_or_quant_mismatch():
+    wrong_arch = SimpleNamespace(
+        architectures=["Qwen3_5ForConditionalGeneration"],
+        quantization_config={"quant_algo": "NVFP4"},
+    )
+    with pytest.raises(ValueError, match="supports .* only"):
+        CONVERT._preflight_config_from_hf(wrong_arch)
+
+    wrong_quant = SimpleNamespace(
+        architectures=["Qwen3_5MoeForConditionalGeneration"],
+        quantization_config={"quant_algo": "FP8"},
+        num_experts=64,
+        hidden_size=1024,
+        moe_intermediate_size=512,
+        num_hidden_layers=24,
+    )
+    with pytest.raises(ValueError, match="native NVFP4"):
+        CONVERT._preflight_config_from_hf(wrong_quant)
