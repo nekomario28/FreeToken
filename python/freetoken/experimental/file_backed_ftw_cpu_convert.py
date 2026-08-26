@@ -78,13 +78,20 @@ def _make_low_memory_native_nvfp4_loader(
                 "low-memory file-backed FTW conversion requires native ModelOpt NVFP4 experts"
             )
 
-        streamer(
+        stats = streamer(
             model_path,
             model_config,
             spec,
             drop_page_cache=drop_page_cache,
             layer_sink=layer_sink,
         )
+        expected_layers = int(model_config.num_moe_layers)
+        actual_layers = int(stats.get("layers_streamed", -1))
+        if actual_layers != expected_layers:
+            raise RuntimeError(
+                "low-memory NVFP4 streamer produced an incomplete layer set: "
+                f"{actual_layers}/{expected_layers}"
+            )
         if bundle_factory is None:
             from freetoken.moe.expert_banks import ExpertBanks
 

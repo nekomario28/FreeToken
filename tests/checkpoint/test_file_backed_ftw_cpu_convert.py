@@ -62,6 +62,28 @@ def test_adapter_streams_through_canonical_layer_sink_and_returns_native_bundle(
     assert bundle.streamed is True
 
 
+def test_adapter_rejects_incomplete_streamer_before_returning_streamed_bundle():
+    def streamer(_model_path, _config, _spec, *, drop_page_cache, layer_sink):
+        layer_sink(0, {"synthetic": object()})
+        return {"layers_streamed": 1, "expert_bank_bytes_streamed": 1}
+
+    loader = make_loader(
+        streamer=streamer,
+        spec=object(),
+        drop_page_cache=lambda _path: None,
+        bundle_factory=lambda **kwargs: SimpleNamespace(**kwargs),
+    )
+
+    with pytest.raises(RuntimeError, match="incomplete layer set: 1/2"):
+        loader(
+            "/model",
+            qwen_config(),
+            device=object(),
+            dtype=object(),
+            layer_sink=lambda *_args: None,
+        )
+
+
 def test_adapter_fails_closed_outside_exact_converter_contract():
     loader = make_loader(
         streamer=lambda *_args, **_kwargs: None,
