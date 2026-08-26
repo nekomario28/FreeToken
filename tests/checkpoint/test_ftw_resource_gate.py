@@ -71,7 +71,32 @@ def test_preflight_reads_only_headers_and_returns_conservative_guards(tmp_path):
         1056 + 8 * 100 + GATE.FIXED_HEADROOM_BYTES
     )
     assert report.as_dict()["source_tensor_bytes"] == 140
-    assert not out.exists()  # preflight must not create output
+    assert not out.exists()
+
+
+def test_preflight_blocks_output_inside_source_tree_before_output(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    _checkpoint(source)
+
+    with pytest.raises(ValueError, match="outside the source checkpoint tree"):
+        GATE.preflight_low_memory_nvfp4_conversion(
+            source,
+            source / "converted-ftw",
+            _config(),
+            disk_free_bytes=1 << 50,
+            mem_available_bytes=1 << 50,
+        )
+    assert not (source / "converted-ftw").exists()
+
+    with pytest.raises(ValueError, match="outside the source checkpoint tree"):
+        GATE.preflight_low_memory_nvfp4_conversion(
+            source,
+            source,
+            _config(),
+            disk_free_bytes=1 << 50,
+            mem_available_bytes=1 << 50,
+        )
 
 
 def test_preflight_blocks_low_disk_or_low_ram_before_output(tmp_path):

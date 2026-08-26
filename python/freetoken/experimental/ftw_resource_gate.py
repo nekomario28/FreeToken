@@ -1,16 +1,16 @@
 """Read-only resource admission for the low-memory native-NVFP4 -> FTW experiment.
 
 The real conversion can be tens of GiB and may expand some packed tensors while fusing or
-converting them.  This module performs a deliberately conservative preflight before any FTW
-shard is created.  It reads only the safetensors index/header metadata plus OS free-space /
+converting them. This module performs a deliberately conservative preflight before any FTW
+shard is created. It reads only the safetensors index/header metadata plus OS free-space /
 MemAvailable counters; no weight payload is materialized.
 
 The estimates are guards, not performance predictions:
 
 * disk guard = 4x all source tensor payload bytes + one FTW alignment page per source tensor
-  + 2 GiB fixed headroom.  4x covers the worst common packed-NVFP4 uint8 -> bf16 expansion.
+  + 2 GiB fixed headroom. 4x covers the worst common packed-NVFP4 uint8 -> bf16 expansion.
 * RAM guard = exact six-bank native-NVFP4 bytes for ONE MoE layer + 8x the largest raw source
-  tensor + 2 GiB fixed headroom.  The 8x term covers multi-part dense fusion/dequant
+  tensor + 2 GiB fixed headroom. The 8x term covers multi-part dense fusion/dequant
   transients without pretending to be an exact allocator model.
 
 Failing a guard means "do not start the real conversion". Passing means only that these
@@ -63,12 +63,12 @@ def native_nvfp4_expert_layer_bytes(model_config: Any) -> int:
             f"native NVFP4 banks require hidden/intermediate divisible by 16, got H={H}, I={I}"
         )
     return (
-        E * (2 * I) * (H // 2)              # gate_up_packed uint8
-        + E * (2 * I) * (H // 16)           # gate_up_scale fp8
-        + E * (2 * I) * 2                    # gate_up_global fp16
-        + E * H * (I // 2)                   # down_packed uint8
-        + E * H * (I // 16)                  # down_scale fp8
-        + E * H * 2                           # down_global fp16
+        E * (2 * I) * (H // 2)
+        + E * (2 * I) * (H // 16)
+        + E * (2 * I) * 2
+        + E * H * (I // 2)
+        + E * H * (I // 16)
+        + E * H * 2
     )
 
 
@@ -93,6 +93,14 @@ def _existing_probe_dir(path: Path) -> Path:
     if not probe.is_dir():
         probe = probe.parent
     return probe
+
+
+def _validate_source_output_separation(source: Path, output: Path) -> None:
+    """Never write the conversion product into the source checkpoint tree."""
+    source_root = source.expanduser().resolve()
+    output_root = output.expanduser().resolve()
+    if output_root == source_root or source_root in output_root.parents:
+        raise ValueError("output directory must be outside the source checkpoint tree")
 
 
 def _validate_output_dir(out_dir: Path) -> None:
@@ -189,6 +197,7 @@ def preflight_low_memory_nvfp4_conversion(
     """Return the resource report or raise before any conversion output is written."""
     source = Path(model_path)
     output = Path(out_dir)
+    _validate_source_output_separation(source, output)
     _validate_output_dir(output)
     shards = _source_shards(source)
     tensor_bytes, tensor_count, largest = _safetensors_header_stats(shards)
