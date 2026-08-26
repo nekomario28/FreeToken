@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import mmap
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -18,6 +19,8 @@ MODULE_PATH = (
 SPEC = importlib.util.spec_from_file_location("mapped_ftw_core_p0", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 CORE = importlib.util.module_from_spec(SPEC)
+# dataclasses + postponed annotations consult sys.modules while the class is created.
+sys.modules[SPEC.name] = CORE
 SPEC.loader.exec_module(CORE)
 
 
