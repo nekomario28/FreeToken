@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import builtins
 import importlib.util
 import json
 import sys
@@ -97,6 +98,34 @@ def test_staged_canonical_conversion_publishes_receipt_only_after_success(tmp_pa
     assert not list(tmp_path.glob(".result-ftw.partial-*"))
 
 
+def test_publish_never_replaces_output_created_during_conversion(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    output = tmp_path / "result-ftw"
+
+    def racing_convert(_model_path, out_dir, **_kwargs):
+        stage = Path(out_dir)
+        stage.mkdir(parents=True, exist_ok=False)
+        (stage / "freetoken_weight.json").write_text("{}", encoding="utf-8")
+        output.mkdir()
+        (output / "owner-marker").write_text("do-not-replace", encoding="utf-8")
+        return _good_index()
+
+    with pytest.raises(FileExistsError, match="refusing to replace"):
+        CONVERT._atomic_staged_canonical_conversion(
+            str(source),
+            str(output),
+            model_config=_config(),
+            preflight_report=FakeReport(),
+            convert_fn=racing_convert,
+            shard_limit=4096,
+            device="cuda:0",
+        )
+
+    assert (output / "owner-marker").read_text(encoding="utf-8") == "do-not-replace"
+    assert not list(tmp_path.glob(".result-ftw.partial-*"))
+
+
 def test_failed_canonical_conversion_never_publishes_and_cleans_partial(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -184,6 +213,30 @@ def test_cli_is_preflight_by_default_and_execute_is_explicit():
     assert execute.execute is True
     assert preflight.shard_limit_gib == 8.0
     assert preflight.device == "cuda:0"
+
+
+def test_preflight_resolver_reads_local_json_without_freetoken_runtime_import(monkeypatch, tmp_path):
+    config = {
+        "architectures": ["Qwen3_5MoeForConditionalGeneration"],
+        "quantization_config": {"quant_algo": "NVFP4"},
+        "num_experts": 128,
+        "hidden_size": 2048,
+        "moe_intermediate_size": 768,
+        "num_hidden_layers": 40,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(config), encoding="utf-8")
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "freetoken.utils" or name.startswith("freetoken.models"):
+            raise AssertionError(f"preflight imported runtime module {name}")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    cfg = CONVERT._resolve_qwen35_preflight_config(str(tmp_path))
+    assert cfg.num_experts == 128
+    assert cfg.num_moe_layers == 40
 
 
 def test_lightweight_preflight_config_accepts_pure_and_mixed_nvfp4_without_runtime_imports():

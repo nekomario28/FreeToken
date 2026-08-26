@@ -1,24 +1,28 @@
 """Safety wrapper for the opt-in Qwen3.5 native-NVFP4 low-memory FTW experiment.
 
-The heavy conversion path intentionally reuses the canonical FTW converter.  Only its
+The heavy conversion path intentionally reuses the canonical FTW converter. Only its
 expert-bank provider is replaced, for one bounded call, by
-``experimental.low_memory_ftw_converter``.  This module owns the outer admission/publication
+``experimental.low_memory_ftw_converter``. This module owns the outer admission/publication
 contract:
 
 * CLI defaults to read-only preflight; ``--execute`` is explicit;
-* preflight inspects lightweight HF config + safetensors headers before model/runtime imports;
-* execution re-parses the runtime config after admission and cross-checks the dimensions;
+* preflight reads local ``config.json`` plus safetensors headers with stdlib only -- no
+  FreeToken model/runtime import is needed before admission;
+* execution re-parses the runtime config after admission and cross-checks dimensions;
 * canonical conversion writes into a hidden sibling staging directory;
 * the resulting canonical FTW index is validated as native NVFP4 with all expected layers;
-* a machine-readable receipt is written before publication;
-* the final output name appears only after the staged conversion is complete;
-* any failure removes the staging directory and leaves the final output unpublished.
+* a machine-readable receipt is fsynced before publication;
+* publication uses Linux ``renameat2(RENAME_NOREPLACE)`` so a concurrently-created output is
+  never replaced;
+* any failure removes staging and leaves the final output unpublished.
 
 The normal ``ft checkpoint`` and normal serving paths remain unchanged.
 """
 from __future__ import annotations
 
 import argparse
+import ctypes
+import errno
 import json
 import os
 import shutil
@@ -33,6 +37,8 @@ _DEFAULT_SHARD_LIMIT = 8 << 30
 _SUPPORTED_ARCH = "Qwen3_5MoeForConditionalGeneration"
 _CONVERSION_TARGET = "cpu_file_backed_native_nvfp4"
 _RECEIPT_NAME = "freetoken_low_memory_conversion_receipt.json"
+_AT_FDCWD = -100
+_RENAME_NOREPLACE = 1
 
 
 def _get(obj: Any, key: str, default=None):
@@ -59,7 +65,7 @@ def _routed_expert_quant_from_hf(hf_config: Any) -> str:
         layers = _get(quant, "quantized_layers", None) or {}
         if isinstance(layers, dict):
             for name, layer_spec in layers.items():
-                if not (name.endswith(".mlp.experts") or ".mlp.experts." in name):
+                if not (str(name).endswith(".mlp.experts") or ".mlp.experts." in str(name)):
                     continue
                 layer_algo = str(_get(layer_spec or {}, "quant_algo", "")).lower()
                 if "fp4" in layer_algo:
@@ -103,9 +109,20 @@ def _preflight_config_from_hf(hf_config: Any):
 
 
 def _resolve_qwen35_preflight_config(model_path: str):
-    from freetoken.utils import cached_load_hf_config
-
-    return _preflight_config_from_hf(cached_load_hf_config(model_path))
+    """Read local config.json directly; resource preflight is intentionally runtime-free."""
+    root = Path(model_path).expanduser().resolve()
+    if not root.is_dir():
+        raise ValueError("preflight requires an existing local checkpoint directory")
+    config_path = root / "config.json"
+    if not config_path.is_file():
+        raise ValueError(f"preflight requires config.json: {root}")
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"checkpoint config.json is unreadable: {exc}") from exc
+    if not isinstance(config, dict):
+        raise ValueError("checkpoint config.json must contain a JSON object")
+    return _preflight_config_from_hf(config)
 
 
 def _resolve_qwen35_runtime_config(model_path: str, preflight_config: Any):
@@ -114,6 +131,12 @@ def _resolve_qwen35_runtime_config(model_path: str, preflight_config: Any):
     from freetoken.models.qwen3_5_moe.config import parse_config
 
     model_config = parse_config(cached_load_hf_config(model_path))
+    architectures = tuple(getattr(model_config, "architectures", ()) or ())
+    if not architectures or architectures[0] != _SUPPORTED_ARCH:
+        raise ValueError(
+            "Qwen3.5 runtime parser disagrees with preflight architecture: "
+            f"{architectures!r}"
+        )
     if not getattr(model_config, "is_moe", False):
         raise ValueError("Qwen3.5 low-memory conversion requires an MoE checkpoint")
     if getattr(model_config, "expert_quant", None) != "nvfp4":
@@ -165,6 +188,35 @@ def _write_receipt(staging: Path, receipt: dict[str, Any]) -> None:
         os.fsync(handle.fileno())
 
 
+def _rename_noreplace(source: Path, destination: Path) -> None:
+    """Atomically publish a directory without ever replacing an existing destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise RuntimeError(
+            "atomic no-replace publication requires Linux renameat2; refusing unsafe fallback"
+        )
+    renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        _AT_FDCWD,
+        os.fsencode(source),
+        _AT_FDCWD,
+        os.fsencode(destination),
+        _RENAME_NOREPLACE,
+    )
+    if result == 0:
+        return
+    err = ctypes.get_errno()
+    if err == errno.EEXIST:
+        raise FileExistsError(err, "output appeared during conversion; refusing to replace it", str(destination))
+    if err in (errno.ENOSYS, errno.EINVAL):
+        raise RuntimeError(
+            "atomic no-replace publication is unavailable on this host/filesystem; refusing unsafe fallback"
+        ) from OSError(err, os.strerror(err), str(destination))
+    raise OSError(err, os.strerror(err), str(destination))
+
+
 def _atomic_staged_canonical_conversion(
     model_path: str,
     out_dir: str,
@@ -208,11 +260,7 @@ def _atomic_staged_canonical_conversion(
             "expert_bank_num_layers": index.get("expert_bank_num_layers"),
         }
         _write_receipt(staging, receipt)
-
-        # Staging is a sibling of output, so this does not cross filesystems. The target was
-        # required to be absent before conversion; any ordinary publication failure leaves the
-        # final name unpublished and is cleaned below.
-        os.rename(staging, output)
+        _rename_noreplace(staging, output)
         published = True
         return index, receipt
     finally:
@@ -245,8 +293,6 @@ def execute_qwen35_native_nvfp4(
     preflight_config = _resolve_qwen35_preflight_config(model_path)
     report = preflight_low_memory_nvfp4_conversion(model_path, out_dir, preflight_config)
     if Path(out_dir).exists():
-        # The generic preflight permits an empty directory for inspection. Atomic publication
-        # deliberately does not replace even an empty user-owned directory.
         raise ValueError("--execute requires --out to not exist; choose a fresh output path")
 
     # Heavy/runtime imports start only after admission.
