@@ -7,6 +7,10 @@ of one explicit conversion call, forces its expert-bank load to use
 ``decode_target="cpu"``. Native NVFP4 is streamable per layer, so the resulting FTW
 is the layout consumed by ``ftw_filebacked_cpu_moe``.
 
+The experimental call also swaps only the converter module's writer symbol for a
+NumPy-free FTWWriter subclass.  This removes ``tensor.numpy()`` from the low-RAM path
+without altering the normal FTW writer or ``ft convert`` surface.
+
 No conversion is started merely by importing this module.
 """
 from __future__ import annotations
@@ -40,16 +44,18 @@ def convert_checkpoint_native_cpu(
     shard_limit: int | None = None,
     device: str | None = None,
 ) -> dict:
-    """Run the standard FTW converter but force native CPU-readable NVFP4 experts.
+    """Run the standard FTW converter with CPU-readable experts and NumPy-free writes.
 
-    The monkeypatch is process-local, serialized, and restored in ``finally``. The
-    resulting index must report ``quant_format == "nvfp4"`` or the experiment fails
-    loudly rather than handing an incompatible FTW to the file-backed runtime.
+    Both monkeypatches are process-local, serialized, and restored in ``finally``.  The
+    writer replacement is scoped to ``freetoken.checkpoint.convert.FTWWriter`` rather
+    than mutating the production FTWWriter class globally.  The resulting index must
+    report native ``nvfp4`` expert banks or the experiment fails closed.
     """
 
+    import freetoken.checkpoint.convert as convert_mod
     import freetoken.moe.expert_banks as expert_banks
-    from freetoken.checkpoint.convert import convert_checkpoint
     from freetoken.checkpoint.ftw import DEFAULT_SHARD_LIMIT
+    from freetoken.experimental.ftw_numpyless_writer import NumpylessFTWWriter
 
     kwargs = {
         "dtype": dtype,
@@ -59,12 +65,15 @@ def convert_checkpoint_native_cpu(
     }
 
     with _PATCH_LOCK:
-        original = expert_banks.load_expert_banks
-        expert_banks.load_expert_banks = _make_cpu_decode_expert_loader(original)
+        original_loader = expert_banks.load_expert_banks
+        original_writer = convert_mod.FTWWriter
+        expert_banks.load_expert_banks = _make_cpu_decode_expert_loader(original_loader)
+        convert_mod.FTWWriter = NumpylessFTWWriter
         try:
-            index = convert_checkpoint(model_path, out_dir, **kwargs)
+            index = convert_mod.convert_checkpoint(model_path, out_dir, **kwargs)
         finally:
-            expert_banks.load_expert_banks = original
+            convert_mod.FTWWriter = original_writer
+            expert_banks.load_expert_banks = original_loader
 
     if index.get("quant_format") != "nvfp4":
         raise RuntimeError(
@@ -79,7 +88,7 @@ def convert_checkpoint_native_cpu(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Experimental native-NVFP4 FTW converter for file-backed CPU-MoE"
+        description="Experimental native-NVFP4 NumPy-free FTW converter for file-backed CPU-MoE"
     )
     parser.add_argument("model_path")
     parser.add_argument("out_dir")
