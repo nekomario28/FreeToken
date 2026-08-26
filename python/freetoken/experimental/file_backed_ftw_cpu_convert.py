@@ -1,17 +1,23 @@
 """Opt-in low-memory FTW conversion for the file-backed CPU MoE experiment.
 
-Canonical ``ft checkpoint`` remains untouched.  This module reuses the canonical
+Canonical ``ft checkpoint`` remains untouched. This module reuses the canonical
 ``convert_checkpoint`` implementation for dense weights, FTW writing, metadata copying and
 fingerprinting, but temporarily substitutes the expert-bank provider during that one call.
 The substitute accepts only Qwen3.5 native NVFP4 and only the converter's ``layer_sink``
-contract.  It streams exactly one native expert layer at a time and never constructs the
+contract. It streams exactly one native expert layer at a time and never constructs the
 whole-model anonymous HostBank set.
 
 The output expert layout is deliberately ``quant_format='nvfp4'`` (six native banks per
 layer), which is the only layout accepted by the file-backed CPU serving experiment.
 GPU-oriented marlin/b12x FTW layouts are never silently reinterpreted as CPU banks.
 
-This is an experimental conversion route, not model-load authority.  A real conversion still
+The canonical converter initializes its requested device through ``torch.cuda.set_device``.
+For this experimental CPU-only route we scope a compatibility shim to the conversion owner
+thread: ``set_device(cpu)`` is skipped, while CUDA requests and all other threads retain the
+canonical behavior. The subsequent canonical ``torch.zeros(..., device=cpu)`` stays on CPU.
+This avoids requiring a GPU runtime merely to write the native CPU-readable FTW layout.
+
+This is an experimental conversion route, not model-load authority. A real conversion still
 requires a separate resource/admission decision before checkpoint payload is read.
 """
 from __future__ import annotations
@@ -22,6 +28,7 @@ from typing import Any, Callable
 
 _QWEN35_ARCH = "Qwen3_5MoeForConditionalGeneration"
 _EXPERT_LOADER_PATCH_LOCK = threading.RLock()
+_CPU_DEVICE_INIT_PATCH_LOCK = threading.RLock()
 
 
 def _architecture(model_config) -> str | None:
@@ -40,10 +47,10 @@ def _make_low_memory_native_nvfp4_loader(
 ) -> Callable[..., Any]:
     """Adapt the one-layer streamer to the canonical ``load_expert_banks`` call shape.
 
-    The converter passes a ``layer_sink`` that writes/release each completed layer.  The
+    The converter passes a ``layer_sink`` that writes/release each completed layer. The
     returned bundle intentionally carries no materialized ``sources``: once ``streamed`` is
     true, canonical ``convert_checkpoint`` consumes only the sink output, quant format and
-    layer count observed by its sink.  Keeping ``sources`` empty makes an accidental serving
+    layer count observed by its sink. Keeping ``sources`` empty makes an accidental serving
     use fail loudly instead of retaining invalid/released tensor views.
     """
 
@@ -128,6 +135,34 @@ def _temporary_expert_loader(module: Any, loader: Callable[..., Any]):
             module.load_expert_banks = original
 
 
+@contextmanager
+def _temporary_cpu_conversion_device(torch_module: Any):
+    """Skip only the canonical owner's invalid ``cuda.set_device(cpu)`` call.
+
+    Canonical conversion currently calls ``torch.cuda.set_device(dev)`` unconditionally.
+    That is correct for its normal CUDA/ROCm route but rejects a CPU ``torch.device`` before
+    any conversion work starts. The low-memory native-NVFP4 experiment is CPU-only, so its
+    owner thread may skip exactly that CPU set-device call. CUDA requests from the owner and
+    every request from other threads are delegated to the original function. The patch is
+    serialized and restored on both success and failure.
+    """
+    with _CPU_DEVICE_INIT_PATCH_LOCK:
+        original = torch_module.cuda.set_device
+        owner_thread = threading.get_ident()
+
+        def scoped_set_device(device):
+            dev = torch_module.device(device)
+            if threading.get_ident() == owner_thread and getattr(dev, "type", None) == "cpu":
+                return None
+            return original(device)
+
+        torch_module.cuda.set_device = scoped_set_device
+        try:
+            yield
+        finally:
+            torch_module.cuda.set_device = original
+
+
 def _require_metadata_preflight(
     model_path: str,
     out_dir: str,
@@ -169,9 +204,10 @@ def convert_file_backed_ftw_cpu(
 ):
     """Convert Qwen3.5 ModelOpt NVFP4 to native, per-layer FTW for CPU file-backed serving.
 
-    This function intentionally has no model-download/load side effects beyond those already
-    performed by canonical ``convert_checkpoint``.  Callers are responsible for external
-    resource admission before invoking it on a real checkpoint.
+    The default conversion device is CPU. This function intentionally has no model-download
+    or model-load side effects beyond those already performed by canonical
+    ``convert_checkpoint``. Callers are responsible for external resource admission before
+    invoking it on a real checkpoint.
     """
     _require_metadata_preflight(model_path, out_dir)
 
@@ -188,20 +224,23 @@ def convert_file_backed_ftw_cpu(
         spec=_NVFP4_SOURCE_SPEC,
         drop_page_cache=drop_page_cache,
     )
+    conversion_device = "cpu" if device is None else device
     with _temporary_expert_loader(expert_module, loader):
-        return convert_checkpoint(
-            model_path,
-            out_dir,
-            dtype=torch.bfloat16 if dtype is None else dtype,
-            moe_backend="offload",
-            shard_limit=DEFAULT_SHARD_LIMIT if shard_limit is None else shard_limit,
-            device=device,
-        )
+        with _temporary_cpu_conversion_device(torch):
+            return convert_checkpoint(
+                model_path,
+                out_dir,
+                dtype=torch.bfloat16 if dtype is None else dtype,
+                moe_backend="offload",
+                shard_limit=DEFAULT_SHARD_LIMIT if shard_limit is None else shard_limit,
+                device=conversion_device,
+            )
 
 
 __all__ = [
     "convert_file_backed_ftw_cpu",
     "_make_low_memory_native_nvfp4_loader",
     "_require_metadata_preflight",
+    "_temporary_cpu_conversion_device",
     "_temporary_expert_loader",
 ]
