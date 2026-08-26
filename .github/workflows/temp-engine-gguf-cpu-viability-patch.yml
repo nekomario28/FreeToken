@@ -1,0 +1,117 @@
+name: TEMP patch ROCm engine GGUF CPU viability
+
+on:
+  push:
+    branches:
+      - tmp/engine-gguf-cpu-viability-patch-20260826
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      FT_BASE: e6dc1d88110aa7f967a21383f5b0f05ceb38befa
+      TARGET_BRANCH: work/rocm-qwen35moe-refresh-cpu-routing-20260826
+    steps:
+      - name: Check out carrier
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Create exact one-function product commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --heads origin "refs/heads/$TARGET_BRANCH" >/dev/null 2>&1; then
+            echo "TARGET_BRANCH_ALREADY_EXISTS=$TARGET_BRANCH"
+            exit 1
+          fi
+
+          git fetch origin "$FT_BASE"
+          git checkout --detach "$FT_BASE"
+          test "$(git rev-parse HEAD)" = "$FT_BASE"
+          test -z "$(git status --porcelain=v1)"
+
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("python/freetoken/engine/engine.py")
+          text = path.read_text()
+          old = '''def _cpu_moe_executor_viable(model_config) -> bool:
+              """Whether an automatic CPU-decode decision may target the CPU MoE executor.
+
+              A default boot must degrade to GPU offload instead of crashing in CpuMoeExecutor after the whole load; explicit cpu/hybrid/--moe-cpu-layers picks still fail loudly."""
+              from freetoken.moe.cpu_executor import _WFMT_IDS, compiled_extension_supports
+
+              try:
+                  from freetoken.kernel import _cpu_moe  # noqa: F401
+              except ImportError:
+                  return False
+              act = getattr(model_config, "hidden_act", "silu")
+              moe_wfmt = getattr(model_config, "moe_weight_format", None)
+              if act not in _CPU_MOE_ACTS and moe_wfmt != "mxfp4":
+                  return False
+              if moe_wfmt != "mxfp4" and not compiled_extension_supports(act):
+                  return False
+              expert_quant = getattr(model_config, "expert_quant", "none")
+              fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+              return fmt == "mxfp4" or fmt in _WFMT_IDS
+          '''
+          new = '''def _cpu_moe_executor_viable(model_config) -> bool:
+              """Whether an automatic CPU-decode decision may target the CPU MoE executor.
+
+              A default boot must degrade to GPU offload instead of crashing in CpuMoeExecutor after the whole load; explicit cpu/hybrid/--moe-cpu-layers picks still fail loudly."""
+              from freetoken.moe.cpu_executor import _WFMT_IDS, compiled_extension_supports
+
+              try:
+                  from freetoken.kernel import _cpu_moe  # noqa: F401
+              except ImportError:
+                  return False
+              act = getattr(model_config, "hidden_act", "silu")
+              moe_wfmt = getattr(model_config, "moe_weight_format", None)
+              if act not in _CPU_MOE_ACTS and moe_wfmt != "mxfp4":
+                  return False
+              if moe_wfmt != "mxfp4" and not compiled_extension_supports(act):
+                  return False
+              expert_quant = getattr(model_config, "expert_quant", "none")
+              fmt = expert_quant if expert_quant != "none" else (moe_wfmt or "bf16")
+              if fmt == "gguf":
+                  from freetoken.moe.cpu_executor import _GGML_TO_CPU_FMT
+
+                  types = getattr(model_config, "gguf_expert_types", None)
+                  if not types:
+                      return False
+                  gate_up, down = int(types[0]), int(types[1])
+                  return gate_up == down and gate_up in _GGML_TO_CPU_FMT
+              return fmt == "mxfp4" or fmt in _WFMT_IDS
+          '''
+          if text.count(old) != 1:
+              raise SystemExit(f"old function match count != 1: {text.count(old)}")
+          text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+
+          python -m py_compile python/freetoken/engine/engine.py
+          git diff --check "$FT_BASE"
+          test "$(git diff --name-only "$FT_BASE" | tr -d '\r')" = "python/freetoken/engine/engine.py"
+
+          grep -q 'from freetoken.gpu_select import bind_assigned_gpu' python/freetoken/engine/engine.py
+          grep -q 'PyNCCL is NVIDIA-only; using PyTorch.*ROCm/RCCL' python/freetoken/engine/engine.py
+          grep -q 'gpu_uuid=gpu_uuid' python/freetoken/engine/engine.py
+          grep -q 'if fmt == "gguf"' python/freetoken/engine/engine.py
+          grep -q 'from freetoken.moe.cpu_executor import _GGML_TO_CPU_FMT' python/freetoken/engine/engine.py
+          grep -q 'gate_up == down and gate_up in _GGML_TO_CPU_FMT' python/freetoken/engine/engine.py
+
+          git switch -c "$TARGET_BRANCH"
+          git config user.name "Yuu"
+          git config user.email "206304251+nekomario28@users.noreply.github.com"
+          git add python/freetoken/engine/engine.py
+          git commit -m "fix(gguf): preserve ROCm engine while enabling CPU viability"
+          test "$(git rev-parse HEAD^)" = "$FT_BASE"
+          echo "PRODUCT_HEAD=$(git rev-parse HEAD)"
+          echo "PRODUCT_TREE=$(git rev-parse HEAD^{tree})"
+          git push origin "HEAD:refs/heads/$TARGET_BRANCH"
