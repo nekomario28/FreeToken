@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,6 +15,7 @@ MODULE_PATH = ROOT / "python/freetoken/experimental/ftw_resource_gate.py"
 SPEC = importlib.util.spec_from_file_location("ftw_resource_gate_under_test", MODULE_PATH)
 assert SPEC is not None and SPEC.loader is not None
 GATE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = GATE
 SPEC.loader.exec_module(GATE)
 
 
