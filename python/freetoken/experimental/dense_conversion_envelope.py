@@ -1,16 +1,14 @@
 """Metadata-only anonymous-RAM envelope for Qwen3.5 mixed-precision FTW conversion.
 
-This module mirrors the allocation-relevant parts of
-``models/qwen3_5_moe/weight.py`` and ``checkpoint/ftw.py`` without opening tensor payloads
-or importing torch. It is intentionally narrow: ModelOpt MIXED_PRECISION Qwen3.5 MoE
-with per-tensor FP8 attention/GDN, native NVFP4 routed/shared experts and optional native
-NVFP4 lm_head.
+This mirrors the allocation-relevant parts of ``models/qwen3_5_moe/weight.py`` and
+``checkpoint/ftw.py`` without opening tensor payloads or importing torch. It is deliberately
+narrow: ModelOpt MIXED_PRECISION Qwen3.5 MoE with per-tensor FP8 attention/GDN, native
+NVFP4 routed/shared experts, and optional native NVFP4 lm_head.
 
-The estimate is an anonymous-allocation upper bound for the dense conversion iterator,
-not a whole-process RSS prediction and not resource admission. Safetensors source tensors
-are file-backed views; their reclaimable page-cache pressure belongs in an external margin.
-Known conversion outputs are contiguous, so ``FTWWriter.add_tensor`` does not require a
-second payload-sized tensor copy on these paths.
+The result bounds anonymous dense-conversion allocations; it is not whole-process RSS or
+resource admission. Safetensors source tensors are file-backed views, so reclaimable source
+page pressure belongs in an external margin. Known outputs on this path are contiguous, so
+``FTWWriter.add_tensor`` does not add another payload-sized tensor copy.
 """
 from __future__ import annotations
 
@@ -52,22 +50,11 @@ _NVFP4_MLP_LAYOUTS = (
     (".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj", ".mlp."),
 )
 _DTYPE_BYTES = {
-    "BOOL": 1,
-    "U8": 1,
-    "I8": 1,
-    "F8_E4M3": 1,
-    "F8_E5M2": 1,
-    "F8_E8M0": 1,
-    "U16": 2,
-    "I16": 2,
-    "F16": 2,
-    "BF16": 2,
-    "U32": 4,
-    "I32": 4,
-    "F32": 4,
-    "U64": 8,
-    "I64": 8,
-    "F64": 8,
+    "BOOL": 1, "U8": 1, "I8": 1,
+    "F8_E4M3": 1, "F8_E5M2": 1, "F8_E8M0": 1,
+    "U16": 2, "I16": 2, "F16": 2, "BF16": 2,
+    "U32": 4, "I32": 4, "F32": 4,
+    "U64": 8, "I64": 8, "F64": 8,
 }
 
 
@@ -102,15 +89,13 @@ def _meta(name: str, spec: dict[str, Any]) -> TensorMeta:
     if not isinstance(shape, list) or not all(isinstance(v, int) and v >= 0 for v in shape):
         raise ValueError("invalid safetensors shape")
     if not (
-        isinstance(offsets, list)
-        and len(offsets) == 2
+        isinstance(offsets, list) and len(offsets) == 2
         and all(isinstance(v, int) and v >= 0 for v in offsets)
         and offsets[1] >= offsets[0]
     ):
         raise ValueError("invalid safetensors data_offsets")
     nbytes = int(offsets[1]) - int(offsets[0])
-    expected = _product(shape) * _DTYPE_BYTES[dtype]
-    if nbytes != expected:
+    if nbytes != _product(shape) * _DTYPE_BYTES[dtype]:
         raise ValueError("safetensors dtype/shape byte count disagrees with data_offsets")
     return TensorMeta(name=name, dtype=dtype, shape=tuple(shape), nbytes=nbytes)
 
@@ -144,30 +129,33 @@ def _expert_quant_nvfp4(config: dict[str, Any]) -> bool:
     layers = _quant_get(config, "quantized_layers", {})
     if not isinstance(layers, dict):
         return False
-    for name, spec in layers.items():
-        if not (str(name).endswith(".mlp.experts") or ".mlp.experts." in str(name)):
-            continue
-        if isinstance(spec, dict) and "fp4" in str(spec.get("quant_algo", "")).lower():
-            return True
-    return False
+    return any(
+        (str(name).endswith(".mlp.experts") or ".mlp.experts." in str(name))
+        and isinstance(spec, dict)
+        and "fp4" in str(spec.get("quant_algo", "")).lower()
+        for name, spec in layers.items()
+    )
 
 
 def _lm_head_nvfp4(config: dict[str, Any]) -> bool:
     layers = _quant_get(config, "quantized_layers", {})
     if not isinstance(layers, dict):
         return False
-    for name, spec in layers.items():
-        if str(name) == "lm_head" or str(name).endswith(".lm_head"):
-            if isinstance(spec, dict) and "fp4" in str(spec.get("quant_algo", "")).lower():
-                return True
-    return False
+    return any(
+        (str(name) == "lm_head" or str(name).endswith(".lm_head"))
+        and isinstance(spec, dict)
+        and "fp4" in str(spec.get("quant_algo", "")).lower()
+        for name, spec in layers.items()
+    )
 
 
-def _fusion_key(base: str, groups: dict[str, tuple[str, ...]]) -> str | None:
+def _fusion_info(
+    base: str, groups: dict[str, tuple[str, ...]]
+) -> tuple[str, int] | None:
     for fused_suffix, parts in groups.items():
         for part in parts:
             if base.endswith(part):
-                return base[: -len(part)] + fused_suffix
+                return base[: -len(part)] + fused_suffix, len(parts)
     return None
 
 
@@ -179,11 +167,7 @@ def estimate_qwen35_mixed_dense_anonymous_peak(
     config: dict[str, Any],
     headers: dict[str, dict[str, Any]],
 ) -> dict[str, Any]:
-    """Return a fail-closed anonymous allocation envelope from safetensors metadata only.
-
-    ``headers`` is the merged tensor-name -> safetensors metadata mapping. Tensor names are
-    used only for classification and are not returned.
-    """
+    """Fail-closed anonymous-allocation envelope from merged safetensors metadata."""
     if not _is_supported_mixed(config):
         raise ValueError("dense envelope supports only Qwen3.5 ModelOpt MIXED_PRECISION")
     if not _expert_quant_nvfp4(config):
@@ -191,15 +175,15 @@ def estimate_qwen35_mixed_dense_anonymous_peak(
 
     metas = {name: _meta(name, spec) for name, spec in headers.items() if name != "__metadata__"}
     lmhead_native = _lm_head_nvfp4(config)
-    dense_native = True  # parse_config: expert_quant==nvfp4 -> dense_quant==nvfp4.
+    dense_native = True  # qwen3_5_moe.parse_config: expert_quant==nvfp4 -> dense_quant==nvfp4.
 
     counts: dict[str, int] = {}
     max_by_class: dict[str, int] = {}
     unsupported = 0
     local_peak = 0
     largest_source_tensor = 0
-    fp8_groups: dict[str, list[TensorMeta]] = {}
-    bf16_groups: dict[str, list[TensorMeta]] = {}
+    fp8_groups: dict[str, tuple[int, list[TensorMeta]]] = {}
+    bf16_groups: dict[str, tuple[int, list[TensorMeta]]] = {}
     nvfp4_groups: dict[str, list[tuple[TensorMeta, TensorMeta, TensorMeta]]] = {}
 
     def record(kind: str, anonymous_bytes: int) -> None:
@@ -207,6 +191,20 @@ def estimate_qwen35_mixed_dense_anonymous_peak(
         counts[kind] = counts.get(kind, 0) + 1
         max_by_class[kind] = max(max_by_class.get(kind, 0), int(anonymous_bytes))
         local_peak = max(local_peak, int(anonymous_bytes))
+
+    def append_group(
+        groups: dict[str, tuple[int, list[TensorMeta]]],
+        info: tuple[str, int],
+        meta: TensorMeta,
+    ) -> None:
+        key, expected = info
+        current = groups.get(key)
+        if current is None:
+            groups[key] = (expected, [meta])
+        elif current[0] != expected:
+            raise ValueError("inconsistent fusion contract")
+        else:
+            current[1].append(meta)
 
     for raw_name, meta in metas.items():
         if ".mlp.experts." in raw_name:
@@ -228,9 +226,9 @@ def estimate_qwen35_mixed_dense_anonymous_peak(
         scale2 = metas.get(raw_base + ".weight_scale_2")
 
         if scale is not None and scale2 is None:
-            fusion_key = _fusion_key(base, _FP8_FUSIONS)
-            if fusion_key is not None:
-                fp8_groups.setdefault(fusion_key, []).append(meta)
+            info = _fusion_info(base, _FP8_FUSIONS)
+            if info is not None:
+                append_group(fp8_groups, info, meta)
                 continue
             record("fp8_standalone", meta.rows * 4)
             continue
@@ -265,25 +263,25 @@ def estimate_qwen35_mixed_dense_anonymous_peak(
                 unsupported += 1
             continue
 
-        fusion_key = _fusion_key(base, _BF16_FUSIONS)
-        if fusion_key is not None:
-            bf16_groups.setdefault(fusion_key, []).append(meta)
+        info = _fusion_info(base, _BF16_FUSIONS)
+        if info is not None:
+            append_group(bf16_groups, info, meta)
             continue
         if _is_gemma_norm(name):
             record("gemma_norm_add", meta.nbytes)
             continue
         record("passthrough", 0)
 
-    for members in fp8_groups.values():
-        if len(members) not in {2, 3}:
+    for expected, members in fp8_groups.values():
+        if len(members) != expected:
             unsupported += 1
             continue
         weight_out = sum(m.nbytes for m in members)
         scale_out = sum(m.rows * 4 for m in members)
         record("fp8_fusion", weight_out + scale_out + 16)
 
-    for members in bf16_groups.values():
-        if len(members) != 2:
+    for expected, members in bf16_groups.values():
+        if len(members) != expected:
             unsupported += 1
             continue
         record("bf16_fusion", sum(m.nbytes for m in members))
@@ -303,9 +301,8 @@ def estimate_qwen35_mixed_dense_anonymous_peak(
     if unsupported:
         raise ValueError(f"dense envelope encountered {unsupported} unsupported/incomplete groups")
 
-    # In adversarial shard/header order, the first half of every native gate/up pair may
-    # retain its per-row global vector before the partner arrives. Add that small upper bound
-    # to the largest local allocation event rather than assuming favorable iteration order.
+    # In adversarial shard/header order, first halves of native gate/up pairs can retain their
+    # per-row global vectors. Add that small upper bound to the largest local allocation event.
     anonymous_peak = local_peak + buffered_native_global_upper
 
     return {
