@@ -4,6 +4,10 @@ Storage ownership and layout validation live in :mod:`mapped_ftw_core`; this mod
 dtype/shape tensor views, the existing FreeToken source shape
 ``dict[bank_name, list[Tensor]]``, and an explicit CPU-only cache-attachment boundary.
 Nothing here changes the default FTW loader or engine path.
+
+Every returned Tensor also carries its :class:`MappedFTWRange` as a private Python attribute.
+That makes mapping lifetime follow the exact tensor objects retained by ``bank_sources`` even
+when an intermediate ``ExpertBanks``/bundle object is released by the canonical engine path.
 """
 from __future__ import annotations
 
@@ -21,6 +25,7 @@ from .mapped_ftw_core import (
 )
 
 PAGEABLE = "pageable"
+_STORAGE_OWNER_ATTR = "_freetoken_mapped_ftw_storage"
 
 
 @dataclass
@@ -90,14 +95,27 @@ def _tensor_from_storage(storage: MappedFTWRange) -> torch.Tensor:
     return tensor
 
 
+def _owned_entry(name: str, storage: MappedFTWRange) -> MappedFTWEntry:
+    """Create a tensor view and make the tensor itself retain the mmap storage owner.
+
+    The bundle-level owner list remains useful for inspection/explicit attachment, but the
+    tensor anchor is the lifetime invariant needed by the canonical loader -> cache path:
+    ``OffloadMoeCache.bank_sources`` retains these tensors after the temporary loader return
+    object is gone.
+    """
+    tensor = _tensor_from_storage(storage)
+    setattr(tensor, _STORAGE_OWNER_ATTR, storage)
+    return MappedFTWEntry(name=name, tensor=tensor, storage=storage)
+
+
 def map_ftw_entry(path: str | os.PathLike[str], name: str) -> MappedFTWEntry:
     storage = map_ftw_range(path, name)
-    return MappedFTWEntry(name=name, tensor=_tensor_from_storage(storage), storage=storage)
+    return _owned_entry(name, storage)
 
 
 def _map_ftw_entry_from_index(path, index, name: str) -> MappedFTWEntry:
     storage = map_ftw_range_from_index(path, index, name)
-    return MappedFTWEntry(name=name, tensor=_tensor_from_storage(storage), storage=storage)
+    return _owned_entry(name, storage)
 
 
 def map_ftw_expert_sources(
@@ -112,7 +130,8 @@ def map_ftw_expert_sources(
 
     The checkpoint index is parsed once, every non-alpha expert bank must use the converter's
     ``bank#Lxxxxx`` layout, and every layer is labelled PAGEABLE because these mappings are
-    neither pinned nor mlocked. The bundle retains all mapping owners explicitly.
+    neither pinned nor mlocked. The bundle retains all mapping owners explicitly, and each
+    returned tensor independently anchors its own storage owner for cache lifetime safety.
     """
 
     index = load_ftw_index(path)
@@ -165,7 +184,8 @@ def attach_file_backed_ftw_sources(
     This is an experimental runtime boundary, not a default loader hook. File-backed mappings
     have no device alias, so every layer must already be CPU-routed and prefill overlap must
     be disabled exactly as ``OffloadMoeCache.set_bank_sources`` requires for PAGEABLE banks.
-    Mapping owners are retained on the cache so tensor storage outlives decode/prefill users.
+    Mapping owners are retained on both the tensors and the cache so storage outlives all
+    decode/prefill users.
     """
 
     num_layers = int(cache.num_layers)

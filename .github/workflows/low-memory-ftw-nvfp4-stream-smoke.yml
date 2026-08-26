@@ -17,6 +17,7 @@ on:
       - "tests/checkpoint/test_mapped_ftw_core_stdlib.py"
       - "tests/checkpoint/test_mapped_ftw_reclaim_stdlib.py"
       - "tests/checkpoint/test_mapped_ftw.py"
+      - "tests/checkpoint/test_mapped_ftw_tensor_owner.py"
       - "tests/checkpoint/test_file_backed_ftw_cpu_server.py"
       - ".github/workflows/low-memory-ftw-nvfp4-stream-smoke.yml"
 
@@ -55,6 +56,7 @@ jobs:
             tests/checkpoint/test_mapped_ftw_core_stdlib.py \
             tests/checkpoint/test_mapped_ftw_reclaim_stdlib.py \
             tests/checkpoint/test_mapped_ftw.py \
+            tests/checkpoint/test_mapped_ftw_tensor_owner.py \
             tests/checkpoint/test_file_backed_ftw_cpu_server.py
           pytest -q \
             tests/models/test_nvfp4_low_memory_stream.py \
@@ -63,4 +65,5 @@ jobs:
             tests/checkpoint/test_mapped_ftw_core_stdlib.py \
             tests/checkpoint/test_mapped_ftw_reclaim_stdlib.py \
             tests/checkpoint/test_mapped_ftw.py \
+            tests/checkpoint/test_mapped_ftw_tensor_owner.py \
             tests/checkpoint/test_file_backed_ftw_cpu_server.py
