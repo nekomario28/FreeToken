@@ -1,13 +1,14 @@
 """Experimental file-backed FTW dense transfer with bounded host registration.
 
-This module is intentionally not wired into the production FTW loader.  It maps one exact
-single-shard ``kind=weight`` FTW entry privately, preallocates its final device tensor, then
-registers/copies/unregisters bounded host windows sequentially.  The source stays file-backed;
-there is no eager anonymous tensor-sized CPU materialization.
+This module is intentionally not wired into the production FTW loader. It maps one exact
+single-shard ``kind=weight`` FTW entry privately and copies bounded registered host windows
+into final device storage. The source stays file-backed; there is no eager anonymous
+CPU tensor-sized materialization.
 
-The first consumer is an exact-dtype synthetic integration gate.  Dtype conversion, async
-pipeline overlap, cross-shard tensors, model loading, and default-loader integration are
-explicitly out of scope until separately validated.
+The ``*_into`` primitive exists so experiments can preallocate/warm the final GPU storage and
+measure the source-transfer envelope independently from device-allocation/runtime-init costs.
+Dtype conversion, async pipeline overlap, cross-shard tensors, model loading, and default-loader
+integration are explicitly out of scope until separately validated.
 """
 from __future__ import annotations
 
@@ -37,6 +38,7 @@ class RegisteredDenseTransferReceipt:
     windows: int
     source_storage: str = "file_backed_private_mmap"
     registration_lifetime: str = "one_window_default_register_copy_sync_unregister"
+    destination_storage: str = "preallocated_final_tensor"
 
 
 def _entry_dtype(entry: dict) -> torch.dtype:
@@ -75,25 +77,11 @@ def _validate_window(window_bytes: int, itemsize: int) -> None:
         raise ValueError("window_bytes must be divisible by dtype itemsize")
 
 
-def copy_ftw_dense_registered_windows(
-    path: str | Path,
-    name: str,
-    *,
-    device: str | torch.device,
-    window_bytes: int = DEFAULT_WINDOW_BYTES,
-) -> tuple[torch.Tensor, RegisteredDenseTransferReceipt]:
-    """Copy one exact-dtype dense FTW entry into its final device tensor.
-
-    Every host registration is balanced in ``finally`` and synchronized before unregister.
-    Only a single-shard ``kind=weight`` entry is accepted.  This function performs no dtype
-    conversion and does not alter the FTW checkpoint.
-    """
-
+def _validated_dense_entry(path: str | Path, name: str):
     index = load_ftw_index(path)
     entry = unique_entry(index, name)
     if entry.get("kind") != "weight":
         raise ValueError("registered dense transfer accepts only kind=weight")
-
     dtype = _entry_dtype(entry)
     shape = _entry_shape(entry)
     itemsize = torch.empty((), dtype=dtype).element_size()
@@ -102,10 +90,38 @@ def copy_ftw_dense_registered_windows(
     nbytes = int(entry.get("nbytes", -1))
     if expected_nbytes != nbytes:
         raise ValueError("FTW dense entry shape/dtype/nbytes disagree")
+    return index, entry, dtype, shape, itemsize, numel, nbytes
+
+
+def copy_ftw_dense_registered_windows_into(
+    path: str | Path,
+    name: str,
+    target: torch.Tensor,
+    *,
+    window_bytes: int = DEFAULT_WINDOW_BYTES,
+) -> RegisteredDenseTransferReceipt:
+    """Copy one exact-dtype dense FTW entry into preallocated final storage.
+
+    The caller owns destination allocation. Every host registration is balanced in ``finally``
+    and GPU copies are synchronized before unregister. Only a single-shard ``kind=weight``
+    entry is accepted. This function performs no dtype conversion and does not alter the FTW.
+    """
+
+    index, _entry, dtype, shape, itemsize, numel, nbytes = _validated_dense_entry(path, name)
     _validate_window(window_bytes, itemsize)
+    if target.dtype != dtype:
+        raise ValueError("registered dense target dtype must exactly match FTW dtype")
+    if tuple(target.shape) != shape:
+        raise ValueError("registered dense target shape must exactly match FTW shape")
+    if not target.is_contiguous():
+        raise ValueError("registered dense target must be contiguous")
 
     owner = map_ftw_range_from_index(path, index, name)
     source = None
+    source_flat = None
+    source_window = None
+    target_flat = None
+    target_window = None
     try:
         if owner.data_offset % mmap.PAGESIZE != 0:
             raise ValueError("FTW dense mapping data address is not page aligned")
@@ -118,7 +134,6 @@ def copy_ftw_dense_registered_windows(
         if source.device.type != "cpu" or not source.is_contiguous():
             raise RuntimeError("FTW mapped dense source must be contiguous CPU storage")
 
-        target = torch.empty(shape, dtype=dtype, device=device)
         source_flat = source.reshape(-1)
         target_flat = target.reshape(-1)
         elements_per_window = window_bytes // itemsize
@@ -144,7 +159,7 @@ def copy_ftw_dense_registered_windows(
                         host_unregister(addr)
                 windows += 1
 
-        receipt = RegisteredDenseTransferReceipt(
+        return RegisteredDenseTransferReceipt(
             name=name,
             dtype=str(dtype).removeprefix("torch."),
             shape=shape,
@@ -152,14 +167,36 @@ def copy_ftw_dense_registered_windows(
             window_bytes=window_bytes,
             windows=windows,
         )
-        return target, receipt
     finally:
+        target_window = None
+        source_window = None
+        target_flat = None
+        source_flat = None
         source = None
         owner.mapping.close()
+
+
+def copy_ftw_dense_registered_windows(
+    path: str | Path,
+    name: str,
+    *,
+    device: str | torch.device,
+    window_bytes: int = DEFAULT_WINDOW_BYTES,
+) -> tuple[torch.Tensor, RegisteredDenseTransferReceipt]:
+    """Allocate final storage, then copy one exact-dtype dense FTW entry into it."""
+
+    _index, _entry, dtype, shape, itemsize, _numel_value, _nbytes = _validated_dense_entry(path, name)
+    _validate_window(window_bytes, itemsize)
+    target = torch.empty(shape, dtype=dtype, device=device)
+    receipt = copy_ftw_dense_registered_windows_into(
+        path, name, target, window_bytes=window_bytes
+    )
+    return target, receipt
 
 
 __all__ = [
     "DEFAULT_WINDOW_BYTES",
     "RegisteredDenseTransferReceipt",
     "copy_ftw_dense_registered_windows",
+    "copy_ftw_dense_registered_windows_into",
 ]
