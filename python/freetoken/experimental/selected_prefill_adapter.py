@@ -1,9 +1,9 @@
 """Prefill-only adapter for fixed-capacity selected-expert NVFP4 banks.
 
 This module is intentionally experimental and does not alter production cache
-semantics.  It binds only ``OffloadMoELayer._prefill_routed`` and therefore does
+semantics. It binds only ``OffloadMoELayer._prefill_routed`` and therefore does
 not construct an :class:`OffloadMoeCache`, decode slot map, LRU state, or CPU MoE
-executor.  The target is the bounded one-forward carrier after one-real-layer
+executor. The target is the bounded one-forward carrier after one-real-layer
 validation is green.
 """
 
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import types
 from dataclasses import dataclass
-from typing import Sequence
 
 import torch
 
@@ -51,19 +50,31 @@ class NativeNvfp4CompactPrefillAdapter:
         capacity: int,
         device: torch.device | str,
     ) -> None:
-        if tuple(sources.keys()) != NVFP4_BANK_ORDER:
+        keys = tuple(sources.keys())
+        expected = set(NVFP4_BANK_ORDER)
+        observed = set(keys)
+        if observed != expected or len(keys) != len(NVFP4_BANK_ORDER):
+            missing = sorted(expected - observed)
+            extra = sorted(observed - expected)
             raise ValueError(
-                f"native NVFP4 bank order mismatch: {tuple(sources.keys())!r}"
+                f"native NVFP4 bank set mismatch: missing={missing}, extra={extra}, keys={keys!r}"
             )
+
         self.num_experts = num_experts
         self.capacity = capacity
         self.device = torch.device(device)
+        # The real file-backed loader currently emits these banks in a different
+        # dictionary order. Kernel argument order is the semantic contract, so
+        # canonicalize explicitly here rather than making loader insertion order
+        # part of the runtime API.
         self.banks = CompactPageablePrefillBanks(
             {name: sources[name] for name in NVFP4_BANK_ORDER},
             num_experts=num_experts,
             capacity=capacity,
             device=self.device,
         )
+        if tuple(self.banks.names) != NVFP4_BANK_ORDER:
+            raise AssertionError("internal NVFP4 bank canonicalization failed")
         self.receipts: list[CompactPrefillLayerReceipt] = []
 
     @property
@@ -149,7 +160,7 @@ def bind_compact_prefill_adapter(model, adapter: NativeNvfp4CompactPrefillAdapte
     """Bind the adapter to every generic OffloadMoELayer in ``model``.
 
     The bound method refuses non-prefill invocation and verifies each layer's
-    geometry/activation at call time.  Decode methods and ``offload_cache`` remain
+    geometry at binding/call time. Decode methods and ``offload_cache`` remain
     untouched; the bounded carrier must not invoke them.
     """
     from freetoken.layers import OffloadMoELayer
