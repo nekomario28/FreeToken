@@ -39,7 +39,6 @@ torch::Tensor create_pinned_tensor_like(torch::Tensor input) {
               "cudaMallocHost failed: ", cudaGetErrorString(alloc_err));
 
   auto options = input.options().device(torch::kCPU).pinned_memory(true);
-
   return torch::from_blob(data_ptr, sizes, strides, free_pinned, options);
 }
 
@@ -55,8 +54,6 @@ torch::Tensor alloc_pinned_tensor(std::vector<int64_t> sizes,
       static_cast<uint64_t>(numel) * c10::elementSize(dtype);
   const size_t alloc_nbytes = static_cast<size_t>(nbytes == 0 ? 1 : nbytes);
 
-  // Portable + mapped: the offload gather kernel reads these banks straight
-  // from host memory (zero-copy), which requires device-mapped pinned pages.
   void *data_ptr = nullptr;
   const cudaError_t alloc_err = cudaHostAlloc(
       &data_ptr, alloc_nbytes, cudaHostAllocPortable | cudaHostAllocMapped);
@@ -67,13 +64,9 @@ torch::Tensor alloc_pinned_tensor(std::vector<int64_t> sizes,
                      .dtype(dtype)
                      .device(torch::kCPU)
                      .pinned_memory(true);
-
   return torch::from_blob(data_ptr, sizes, free_pinned, options);
 }
 
-// Pinned host memory is GPU-dereferenceable at its host VA only where UVA identity
-// holds (Linux; not Windows/WDDM, where cudaHostRegister'd memory maps to a different
-// device address). Zero-copy consumers resolve bank base addresses through these.
 bool host_ptr_identity() {
   int device = 0;
   const cudaError_t err = cudaGetDevice(&device);
@@ -104,6 +97,16 @@ void host_register(int64_t addr, int64_t nbytes) {
               "cudaHostRegister failed: ", cudaGetErrorString(err));
 }
 
+void host_register_transfer(int64_t addr, int64_t nbytes) {
+  TORCH_CHECK(addr != 0, "host transfer register address must be non-zero");
+  TORCH_CHECK(nbytes > 0, "host transfer register byte count must be positive");
+  const cudaError_t err =
+      cudaHostRegister(reinterpret_cast<void *>(addr), static_cast<size_t>(nbytes),
+                       cudaHostRegisterDefault);
+  TORCH_CHECK(err == cudaSuccess,
+              "cudaHostRegister(default) failed: ", cudaGetErrorString(err));
+}
+
 void host_unregister(int64_t addr) {
   TORCH_CHECK(addr != 0, "host unregister address must be non-zero");
   const cudaError_t err = cudaHostUnregister(reinterpret_cast<void *>(addr));
@@ -112,7 +115,7 @@ void host_unregister(int64_t addr) {
 }
 
 int64_t driver_cuda_version() {
-  int version = 0;  // stays 0 when no driver is installed
+  int version = 0;
   const cudaError_t err = cudaDriverGetVersion(&version);
   TORCH_CHECK(err == cudaSuccess,
               "cudaDriverGetVersion failed: ", cudaGetErrorString(err));
@@ -131,9 +134,11 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("host_device_ptr", &host_device_ptr,
         "Device-visible alias of a pinned+mapped host address");
   m.def("host_register", &host_register,
-        "cudaHostRegister an existing host range as portable+mapped");
+        "Register an existing host range as portable+mapped for zero-copy dereference");
+  m.def("host_register_transfer", &host_register_transfer,
+        "Register an existing host range with default flags for bounded H2D transfer");
   m.def("host_unregister", &host_unregister,
-        "cudaHostUnregister a previously registered host range");
+        "Unregister a previously registered host range");
   m.def("driver_cuda_version", &driver_cuda_version,
         "Max CUDA version the installed NVIDIA driver supports (0 if none)");
 }
