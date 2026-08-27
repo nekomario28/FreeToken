@@ -52,6 +52,33 @@ class ReadonlyDenseTests(unittest.TestCase):
             self.assertEqual(len(registers), receipt.windows)
             self.assertEqual([row[1] for row in registers], [row[1] for row in unregisters])
 
+    def test_scalar_entry_preserves_value_and_file_identity(self):
+        with tempfile.TemporaryDirectory() as td:
+            source = torch.tensor(1.25, dtype=torch.float32)
+            root = _write_fixture(Path(td), source)
+            before = _shard_hash(root)
+            events = []
+            with mock.patch.object(
+                readonly,
+                "host_register_transfer",
+                side_effect=lambda addr, nbytes: events.append(("register", addr, nbytes)),
+            ), mock.patch.object(
+                readonly,
+                "host_unregister",
+                side_effect=lambda addr: events.append(("unregister", addr)),
+            ):
+                target, receipt = readonly.copy_ftw_dense_readonly_windows(
+                    root, "dense.weight", device="cpu", window_bytes=4096
+                )
+            self.assertEqual(tuple(target.shape), ())
+            self.assertTrue(torch.equal(target, source))
+            self.assertEqual(before, _shard_hash(root))
+            self.assertEqual(receipt.shape, ())
+            self.assertEqual(receipt.nbytes, 4)
+            self.assertEqual(receipt.windows, 1)
+            self.assertEqual(receipt.source_storage, "file_backed_readonly_mmap")
+            self.assertEqual([row[2] for row in events if row[0] == "register"], [4])
+
     def test_rejects_expert_entry(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
