@@ -3,8 +3,8 @@
 The caller supplies the *complete* loader contract as ``name -> DenseExpectedSpec``.  This
 keeps model-specific discovery (reflective keys, loader-only keys, optional extras) separate
 from the storage/transfer primitive.  The materializer requires exact key and shape equality,
-loads each FTW tensor with the registered-window direct-runtime H2D path, and performs any
-required dtype conversion on the GPU.
+loads each FTW tensor from a read-only file mapping with the registered-window direct-runtime
+H2D path, and performs any required dtype conversion on the GPU.
 
 This module is deliberately opt-in and is not wired into the canonical engine loader.
 """
@@ -17,10 +17,12 @@ from typing import Mapping
 import torch
 
 from freetoken.checkpoint.mapped_ftw_core import load_ftw_index
+from freetoken.experimental.ftw_readonly_dense import (
+    copy_ftw_dense_readonly_windows as copy_ftw_dense_registered_windows,
+)
 from freetoken.experimental.ftw_registered_dense import (
     DEFAULT_WINDOW_BYTES,
     RegisteredDenseTransferReceipt,
-    copy_ftw_dense_registered_windows,
 )
 
 
@@ -40,7 +42,7 @@ class DirectDenseStateReceipt:
     max_cast_source_bytes: int
     max_cast_final_bytes: int
     window_bytes: int
-    transfer_path: str = "file_backed_registered_window_direct_runtime_h2d"
+    transfer_path: str = "file_backed_readonly_registered_window_direct_runtime_h2d"
     cast_path: str = "gpu_only"
 
 
@@ -88,7 +90,7 @@ def materialize_ftw_dense_state_direct(
 ) -> tuple[dict[str, torch.Tensor], DirectDenseStateReceipt]:
     """Materialize the complete dense FTW loader state directly onto ``device``.
 
-    Source-dtype bytes travel FTW -> file-backed mmap -> registered window -> final-or-temporary
+    Source-dtype bytes travel FTW -> read-only file mmap -> registered window -> final-or-temporary
     GPU tensor via the direct runtime H2D primitive.  If the loader contract requires a dtype
     change, conversion happens GPU->GPU and the source-dtype temporary is released immediately.
     No tensor-sized anonymous CPU materialization is introduced by this function.
@@ -141,6 +143,8 @@ def materialize_ftw_dense_state_direct(
         )
         if transfer_receipt.gpu_copy_path != "direct_runtime_h2d":
             raise RuntimeError("direct dense state materializer requires direct runtime H2D")
+        if transfer_receipt.source_storage != "file_backed_readonly_mmap":
+            raise RuntimeError("direct dense state materializer requires read-only file-backed source")
 
         source_bytes += nbytes
         max_source_tensor_bytes = max(max_source_tensor_bytes, nbytes)
