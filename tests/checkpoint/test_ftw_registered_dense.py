@@ -21,10 +21,14 @@ def _write_fixture(root: Path, tensor: torch.Tensor, *, shard_limit: int = 1 << 
 class RegisteredDenseTests(unittest.TestCase):
     def test_cpu_fixture_preserves_bytes_and_balances_windows(self):
         with tempfile.TemporaryDirectory() as td:
-            root = _write_fixture(Path(td), torch.arange(8192, dtype=torch.int32))
             source = torch.arange(8192, dtype=torch.int32)
+            root = _write_fixture(Path(td), source)
             events = []
-            with mock.patch.object(registered, "host_register", side_effect=lambda addr, nbytes: events.append(("register", addr, nbytes))), mock.patch.object(
+            with mock.patch.object(
+                registered,
+                "host_register_transfer",
+                side_effect=lambda addr, nbytes: events.append(("register_transfer", addr, nbytes)),
+            ), mock.patch.object(
                 registered, "host_unregister", side_effect=lambda addr: events.append(("unregister", addr))
             ):
                 target, receipt = registered.copy_ftw_dense_registered_windows(
@@ -34,12 +38,16 @@ class RegisteredDenseTests(unittest.TestCase):
             self.assertEqual(receipt.nbytes, source.numel() * source.element_size())
             self.assertEqual(receipt.window_bytes, 4096)
             self.assertEqual(receipt.windows, receipt.nbytes // 4096)
-            registers = [row for row in events if row[0] == "register"]
+            registers = [row for row in events if row[0] == "register_transfer"]
             unregisters = [row for row in events if row[0] == "unregister"]
             self.assertEqual(len(registers), receipt.windows)
             self.assertEqual(len(unregisters), receipt.windows)
             self.assertEqual([row[1] for row in registers], [row[1] for row in unregisters])
             self.assertTrue(all(row[2] == 4096 for row in registers))
+            self.assertEqual(
+                receipt.registration_lifetime,
+                "one_window_default_register_copy_sync_unregister",
+            )
 
     def test_rejects_expert_entry(self):
         with tempfile.TemporaryDirectory() as td:
@@ -55,7 +63,9 @@ class RegisteredDenseTests(unittest.TestCase):
     def test_fails_closed_when_entry_spans_shards(self):
         with tempfile.TemporaryDirectory() as td:
             root = _write_fixture(Path(td), torch.arange(8192, dtype=torch.uint8), shard_limit=4096)
-            with mock.patch.object(registered, "host_register"), mock.patch.object(registered, "host_unregister"):
+            with mock.patch.object(registered, "host_register_transfer"), mock.patch.object(
+                registered, "host_unregister"
+            ):
                 with self.assertRaisesRegex(ValueError, "exactly one shard"):
                     registered.copy_ftw_dense_registered_windows(
                         root, "dense.weight", device="cpu", window_bytes=4096
@@ -64,7 +74,11 @@ class RegisteredDenseTests(unittest.TestCase):
     def test_rejects_unaligned_window_before_registration(self):
         with tempfile.TemporaryDirectory() as td:
             root = _write_fixture(Path(td), torch.arange(4096, dtype=torch.uint8))
-            with mock.patch.object(registered, "host_register", side_effect=AssertionError("must not register")):
+            with mock.patch.object(
+                registered,
+                "host_register_transfer",
+                side_effect=AssertionError("must not register"),
+            ):
                 with self.assertRaisesRegex(ValueError, "page aligned"):
                     registered.copy_ftw_dense_registered_windows(
                         root, "dense.weight", device="cpu", window_bytes=4095
