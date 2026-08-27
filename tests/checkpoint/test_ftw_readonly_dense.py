@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +21,8 @@ def _write_fixture(root: Path, tensor: torch.Tensor, *, shard_limit: int = 1 << 
 
 
 def _shard_hash(root: Path) -> str:
-    shard = next(root.glob("*.bin"))
+    index = json.loads((root / "freetoken_weight.json").read_text(encoding="utf-8"))
+    shard = root / index["shards"][0]["file"]
     return hashlib.sha256(shard.read_bytes()).hexdigest()
 
 
