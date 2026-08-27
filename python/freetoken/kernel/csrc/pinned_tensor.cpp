@@ -114,6 +114,19 @@ void host_unregister(int64_t addr) {
               "cudaHostUnregister failed: ", cudaGetErrorString(err));
 }
 
+void registered_host_to_device_copy(int64_t dst_addr, int64_t src_addr,
+                                    int64_t nbytes) {
+  TORCH_CHECK(dst_addr != 0, "device copy destination address must be non-zero");
+  TORCH_CHECK(src_addr != 0, "device copy source address must be non-zero");
+  TORCH_CHECK(nbytes > 0, "device copy byte count must be positive");
+  const cudaError_t err = cudaMemcpy(
+      reinterpret_cast<void *>(dst_addr),
+      reinterpret_cast<const void *>(src_addr),
+      static_cast<size_t>(nbytes), cudaMemcpyHostToDevice);
+  TORCH_CHECK(err == cudaSuccess,
+              "cudaMemcpy(host-to-device) failed: ", cudaGetErrorString(err));
+}
+
 int64_t driver_cuda_version() {
   int version = 0;
   const cudaError_t err = cudaDriverGetVersion(&version);
@@ -139,6 +152,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Register an existing host range with default flags for bounded H2D transfer");
   m.def("host_unregister", &host_unregister,
         "Unregister a previously registered host range");
+  m.def("registered_host_to_device_copy", &registered_host_to_device_copy,
+        "Synchronously copy registered host bytes directly into device storage");
   m.def("driver_cuda_version", &driver_cuda_version,
         "Max CUDA version the installed NVIDIA driver supports (0 if none)");
 }
