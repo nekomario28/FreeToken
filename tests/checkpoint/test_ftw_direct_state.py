@@ -44,7 +44,7 @@ class DirectDenseStateTests(unittest.TestCase):
                     nbytes=source.numel() * source.element_size(),
                     window_bytes=window_bytes,
                     windows=1,
-                    gpu_copy_path="direct_runtime_h2d",
+                    source_storage="file_backed_readonly_mmap",
                 )
 
             with mock.patch.object(direct_state, "copy_ftw_dense_registered_windows", side_effect=fake_copy):
@@ -60,6 +60,10 @@ class DirectDenseStateTests(unittest.TestCase):
             self.assertTrue(torch.equal(state["cast"], tensors["cast"].to(torch.float32)))
             self.assertEqual(receipt.tensor_count, 3)
             self.assertEqual(receipt.dtype_cast_count, 1)
+            self.assertEqual(
+                receipt.transfer_path,
+                "file_backed_readonly_registered_window_direct_runtime_h2d",
+            )
             self.assertGreater(receipt.max_cast_source_bytes, 0)
             self.assertGreater(receipt.max_cast_final_bytes, receipt.max_cast_source_bytes)
 
