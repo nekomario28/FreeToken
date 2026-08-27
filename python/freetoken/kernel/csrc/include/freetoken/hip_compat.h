@@ -60,6 +60,10 @@
 #define cudaHostRegister hipHostRegister
 #endif
 
+#ifndef cudaHostUnregister
+#define cudaHostUnregister hipHostUnregister
+#endif
+
 #ifndef cudaHostRegisterPortable
 #define cudaHostRegisterPortable hipHostRegisterPortable
 #endif
