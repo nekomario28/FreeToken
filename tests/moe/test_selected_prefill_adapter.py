@@ -35,11 +35,40 @@ def _tiny_sources(order=NVFP4_BANK_ORDER):
     }
 
 
-def test_adapter_requires_canonical_native_nvfp4_bank_order():
-    wrong = tuple(reversed(NVFP4_BANK_ORDER))
-    with pytest.raises(ValueError, match="bank order mismatch"):
+def test_adapter_canonicalizes_real_loader_style_bank_order():
+    loader_style = (
+        "down_global",
+        "down_packed",
+        "down_scale",
+        "gate_up_global",
+        "gate_up_packed",
+        "gate_up_scale",
+    )
+    adapter = NativeNvfp4CompactPrefillAdapter(
+        _tiny_sources(loader_style),
+        num_experts=4,
+        capacity=2,
+        device="cpu",
+    )
+    assert tuple(adapter.banks.names) == NVFP4_BANK_ORDER
+
+
+def test_adapter_rejects_missing_or_unknown_bank_names():
+    missing = _tiny_sources()
+    missing.pop("down_global")
+    with pytest.raises(ValueError, match="bank set mismatch"):
         NativeNvfp4CompactPrefillAdapter(
-            _tiny_sources(wrong),
+            missing,
+            num_experts=4,
+            capacity=2,
+            device="cpu",
+        )
+
+    extra = _tiny_sources()
+    extra["unexpected"] = [torch.zeros((4, 1), dtype=torch.float32)]
+    with pytest.raises(ValueError, match="bank set mismatch"):
+        NativeNvfp4CompactPrefillAdapter(
+            extra,
             num_experts=4,
             capacity=2,
             device="cpu",
