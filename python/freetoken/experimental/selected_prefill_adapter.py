@@ -31,6 +31,15 @@ NVFP4_BANK_ORDER = (
 )
 
 
+def _canonical_device(device: torch.device | str) -> torch.device:
+    resolved = torch.device(device)
+    if resolved.type == "cuda" and resolved.index is None:
+        if not torch.cuda.is_available():
+            raise ValueError("implicit CUDA device requested but CUDA/ROCm is unavailable")
+        resolved = torch.device("cuda", torch.cuda.current_device())
+    return resolved
+
+
 @dataclass(frozen=True)
 class CompactPrefillLayerReceipt:
     layer_id: int
@@ -62,7 +71,7 @@ class NativeNvfp4CompactPrefillAdapter:
 
         self.num_experts = num_experts
         self.capacity = capacity
-        self.device = torch.device(device)
+        self.device = _canonical_device(device)
         # The real file-backed loader currently emits these banks in a different
         # dictionary order. Kernel argument order is the semantic contract, so
         # canonicalize explicitly here rather than making loader insertion order
