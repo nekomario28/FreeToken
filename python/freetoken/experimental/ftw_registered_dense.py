@@ -57,8 +57,8 @@ def _entry_dtype(entry: dict) -> torch.dtype:
 
 def _entry_shape(entry: dict) -> tuple[int, ...]:
     raw = entry.get("shape")
-    if not isinstance(raw, list) or not raw:
-        raise ValueError("FTW dense entry shape must be a non-empty list")
+    if not isinstance(raw, list):
+        raise ValueError("FTW dense entry shape must be a list")
     shape = tuple(int(value) for value in raw)
     if any(value < 0 for value in shape):
         raise ValueError("FTW dense entry shape dimensions must be non-negative")
