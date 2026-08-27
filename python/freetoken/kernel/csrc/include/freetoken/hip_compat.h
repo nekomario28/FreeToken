@@ -1,19 +1,8 @@
 #pragma once
 
 // HIP compatibility shim: maps CUDA runtime API names to HIP equivalents so
-// the same C++ source compiles under both nvcc and hipcc.  Include this instead
+// the same C++ source compiles under both nvcc and hipcc. Include this instead
 // of <cuda_runtime_api.h> directly when the file needs the runtime API.
-//
-// On NVIDIA platforms the CUDA headers are included as-is and every macro below
-// resolves to the original CUDA symbol, so there is zero overhead.
-//
-// Supported ROCm targets:
-//   gfx1100 — RX 7900 XTX / XT
-//   gfx1101 — RX 7900 GRE
-//   gfx1102 — RX 7700 / XT
-//   gfx1103 — RX 7600 / XT
-//   gfx1200 — RX 9060 family
-//   gfx1201 — RX 9070 family / Radeon AI PRO R9700
 
 #if defined(__HIP_PLATFORM_AMD__) || defined(USE_ROCM)
 
@@ -66,6 +55,12 @@
 #endif
 #ifndef cudaHostGetDevicePointer
 #define cudaHostGetDevicePointer hipHostGetDevicePointer
+#endif
+#ifndef cudaMemcpy
+#define cudaMemcpy hipMemcpy
+#endif
+#ifndef cudaMemcpyHostToDevice
+#define cudaMemcpyHostToDevice hipMemcpyHostToDevice
 #endif
 #ifndef cudaGetDevice
 #define cudaGetDevice hipGetDevice
