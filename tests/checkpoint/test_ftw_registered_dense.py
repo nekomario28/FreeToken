@@ -46,8 +46,9 @@ class RegisteredDenseTests(unittest.TestCase):
             self.assertTrue(all(row[2] == 4096 for row in registers))
             self.assertEqual(
                 receipt.registration_lifetime,
-                "one_window_default_register_copy_sync_unregister",
+                "one_window_default_register_direct_copy_unregister",
             )
+            self.assertEqual(receipt.gpu_copy_path, "torch_cpu_copy")
 
     def test_rejects_expert_entry(self):
         with tempfile.TemporaryDirectory() as td:
