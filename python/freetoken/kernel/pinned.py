@@ -54,8 +54,22 @@ def host_register(addr: int, nbytes: int) -> None:
     _load_pinned_extension().host_register(addr, nbytes)
 
 
+def host_register_transfer(addr: int, nbytes: int) -> None:
+    """Register an existing host range with default flags for H2D transfer.
+
+    This is intentionally separate from :func:`host_register`: mapped/portable
+    registration is for GPU zero-copy dereference, while this primitive is for
+    bounded file-backed host-to-device transfer without requesting a mapped alias.
+    """
+    if addr <= 0:
+        raise ValueError("host transfer register address must be positive")
+    if nbytes <= 0:
+        raise ValueError("host transfer register byte count must be positive")
+    _load_pinned_extension().host_register_transfer(addr, nbytes)
+
+
 def host_unregister(addr: int) -> None:
-    """Unregister a host range previously registered with :func:`host_register`."""
+    """Unregister a host range previously registered with a host-register primitive."""
     if addr <= 0:
         raise ValueError("host unregister address must be positive")
     _load_pinned_extension().host_unregister(addr)
