@@ -5,10 +5,9 @@ single-shard ``kind=weight`` FTW entry privately and copies bounded registered h
 into final device storage. The source stays file-backed; there is no eager anonymous
 CPU tensor-sized materialization.
 
-The ``*_into`` primitive exists so experiments can preallocate/warm the final GPU storage and
-measure the source-transfer envelope independently from device-allocation/runtime-init costs.
-Dtype conversion, async pipeline overlap, cross-shard tensors, model loading, and default-loader
-integration are explicitly out of scope until separately validated.
+For CUDA/HIP targets the experimental path bypasses ``Tensor.copy_`` and calls the runtime
+copy primitive directly. This isolates framework-owned host staging from the storage/transfer
+contract while keeping the final destination a normal torch tensor.
 """
 from __future__ import annotations
 
@@ -23,7 +22,11 @@ from freetoken.checkpoint.mapped_ftw_core import (
     map_ftw_range_from_index,
     unique_entry,
 )
-from freetoken.kernel.pinned import host_register_transfer, host_unregister
+from freetoken.kernel.pinned import (
+    host_register_transfer,
+    host_unregister,
+    registered_host_to_device_copy,
+)
 
 DEFAULT_WINDOW_BYTES = 16 * 1024**2
 
@@ -37,8 +40,9 @@ class RegisteredDenseTransferReceipt:
     window_bytes: int
     windows: int
     source_storage: str = "file_backed_private_mmap"
-    registration_lifetime: str = "one_window_default_register_copy_sync_unregister"
+    registration_lifetime: str = "one_window_default_register_direct_copy_unregister"
     destination_storage: str = "preallocated_final_tensor"
+    gpu_copy_path: str = "direct_runtime_h2d"
 
 
 def _entry_dtype(entry: dict) -> torch.dtype:
@@ -102,9 +106,9 @@ def copy_ftw_dense_registered_windows_into(
 ) -> RegisteredDenseTransferReceipt:
     """Copy one exact-dtype dense FTW entry into preallocated final storage.
 
-    The caller owns destination allocation. Every host registration is balanced in ``finally``
-    and GPU copies are synchronized before unregister. Only a single-shard ``kind=weight``
-    entry is accepted. This function performs no dtype conversion and does not alter the FTW.
+    Every host registration is balanced in ``finally``. GPU targets use a synchronous direct
+    CUDA/HIP runtime H2D copy so registered source pages do not pass through PyTorch's generic
+    host-copy path. CPU targets retain ``Tensor.copy_`` for dependency-free structural tests.
     """
 
     index, _entry, dtype, shape, itemsize, numel, nbytes = _validated_dense_entry(path, name)
@@ -143,20 +147,23 @@ def copy_ftw_dense_registered_windows_into(
                 end = min(numel, start + elements_per_window)
                 source_window = source_flat[start:end]
                 target_window = target_flat[start:end]
-                addr = int(source_window.data_ptr())
+                src_addr = int(source_window.data_ptr())
                 bytes_this_window = int(source_window.numel()) * itemsize
-                if addr % mmap.PAGESIZE != 0:
+                if src_addr % mmap.PAGESIZE != 0:
                     raise RuntimeError("registered FTW source window address is not page aligned")
                 registered = False
                 try:
-                    host_register_transfer(addr, bytes_this_window)
+                    host_register_transfer(src_addr, bytes_this_window)
                     registered = True
-                    target_window.copy_(source_window, non_blocking=False)
                     if target.device.type == "cuda":
-                        torch.cuda.synchronize(device=target.device)
+                        registered_host_to_device_copy(
+                            int(target_window.data_ptr()), src_addr, bytes_this_window
+                        )
+                    else:
+                        target_window.copy_(source_window)
                 finally:
                     if registered:
-                        host_unregister(addr)
+                        host_unregister(src_addr)
                 windows += 1
 
         return RegisteredDenseTransferReceipt(
@@ -166,6 +173,7 @@ def copy_ftw_dense_registered_windows_into(
             nbytes=nbytes,
             window_bytes=window_bytes,
             windows=windows,
+            gpu_copy_path="direct_runtime_h2d" if target.device.type == "cuda" else "torch_cpu_copy",
         )
     finally:
         target_window = None
