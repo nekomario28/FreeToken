@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from freetoken.distributed import set_tp_info
 from freetoken.experimental.selected_prefill_adapter import (
     NVFP4_BANK_ORDER,
     NativeNvfp4CompactPrefillAdapter,
@@ -33,6 +34,17 @@ def _tiny_sources(order=NVFP4_BANK_ORDER):
         name: [torch.zeros(shapes[name], dtype=dtypes[name]).contiguous()]
         for name in order
     }
+
+
+def _offload_layer(*, num_experts: int) -> OffloadMoELayer:
+    set_tp_info(0, 1)
+    return OffloadMoELayer(
+        layer_id=0,
+        num_experts=num_experts,
+        top_k=2,
+        hidden_size=8,
+        intermediate_size=4,
+    )
 
 
 def test_adapter_canonicalizes_real_loader_style_bank_order():
@@ -96,13 +108,7 @@ def test_adapter_allocates_only_fixed_compact_capacity_and_starts_empty():
 
 
 def test_binding_does_not_attach_production_offload_cache():
-    layer = OffloadMoELayer(
-        layer_id=0,
-        num_experts=4,
-        top_k=2,
-        hidden_size=8,
-        intermediate_size=4,
-    )
+    layer = _offload_layer(num_experts=4)
     adapter = NativeNvfp4CompactPrefillAdapter(
         _tiny_sources(),
         num_experts=4,
@@ -116,13 +122,7 @@ def test_binding_does_not_attach_production_offload_cache():
 
 
 def test_binding_rejects_geometry_drift():
-    layer = OffloadMoELayer(
-        layer_id=0,
-        num_experts=8,
-        top_k=2,
-        hidden_size=8,
-        intermediate_size=4,
-    )
+    layer = _offload_layer(num_experts=8)
     adapter = NativeNvfp4CompactPrefillAdapter(
         _tiny_sources(),
         num_experts=4,
