@@ -40,14 +40,25 @@ def copy_to_pinned_tensor(input: torch.Tensor) -> torch.Tensor:
 
 
 def alloc_pinned_tensor(*shape: int, dtype: torch.dtype) -> torch.Tensor:
-    """Allocate an exact-size, uninitialized pinned host tensor via cudaHostAlloc."""
+    """Allocate an exact-size, uninitialized CPU pinned tensor via cudaHostAlloc."""
 
     return _load_pinned_extension().alloc_pinned_tensor(list(shape), dtype)
 
 
 def host_register(addr: int, nbytes: int) -> None:
-    """cudaHostRegister ``nbytes`` at ``addr`` as portable+mapped (pin-after-fill)."""
+    """Register an existing host range as portable+mapped pinned memory."""
+    if addr <= 0:
+        raise ValueError("host register address must be positive")
+    if nbytes <= 0:
+        raise ValueError("host register byte count must be positive")
     _load_pinned_extension().host_register(addr, nbytes)
+
+
+def host_unregister(addr: int) -> None:
+    """Unregister a host range previously registered with :func:`host_register`."""
+    if addr <= 0:
+        raise ValueError("host unregister address must be positive")
+    _load_pinned_extension().host_unregister(addr)
 
 
 @lru_cache(maxsize=1)
