@@ -22,7 +22,7 @@ from freetoken.checkpoint.mapped_ftw_core import (
     map_ftw_range_from_index,
     unique_entry,
 )
-from freetoken.kernel.pinned import host_register, host_unregister
+from freetoken.kernel.pinned import host_register_transfer, host_unregister
 
 DEFAULT_WINDOW_BYTES = 16 * 1024**2
 
@@ -36,7 +36,7 @@ class RegisteredDenseTransferReceipt:
     window_bytes: int
     windows: int
     source_storage: str = "file_backed_private_mmap"
-    registration_lifetime: str = "one_window_register_copy_sync_unregister"
+    registration_lifetime: str = "one_window_default_register_copy_sync_unregister"
 
 
 def _entry_dtype(entry: dict) -> torch.dtype:
@@ -134,7 +134,7 @@ def copy_ftw_dense_registered_windows(
                     raise RuntimeError("registered FTW source window address is not page aligned")
                 registered = False
                 try:
-                    host_register(addr, bytes_this_window)
+                    host_register_transfer(addr, bytes_this_window)
                     registered = True
                     target_window.copy_(source_window, non_blocking=False)
                     if target.device.type == "cuda":
