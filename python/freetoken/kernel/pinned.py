@@ -75,6 +75,17 @@ def host_unregister(addr: int) -> None:
     _load_pinned_extension().host_unregister(addr)
 
 
+def registered_host_to_device_copy(dst_addr: int, src_addr: int, nbytes: int) -> None:
+    """Synchronously copy registered host bytes directly into device storage."""
+    if dst_addr <= 0:
+        raise ValueError("device copy destination address must be positive")
+    if src_addr <= 0:
+        raise ValueError("device copy source address must be positive")
+    if nbytes <= 0:
+        raise ValueError("device copy byte count must be positive")
+    _load_pinned_extension().registered_host_to_device_copy(dst_addr, src_addr, nbytes)
+
+
 @lru_cache(maxsize=1)
 def _host_ptr_identity() -> bool:
     # cached per process: FreeToken pins one CUDA device per process (set at engine launch)
