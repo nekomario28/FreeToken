@@ -8,21 +8,48 @@ weights, runs inference, starts a service, performs network I/O, or grants execu
 from __future__ import annotations
 
 import hashlib
+import importlib.util
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-
-from freetoken.checkpoint.mapped_ftw_core import (
-    INDEX_NAME,
-    _as_int,
-    _safe_shard_path,
-    load_ftw_index,
-)
 
 SCHEMA_VERSION = "freetoken-file-backed-ftw-runtime-identity/0.1"
 IDENTITY_ROUTE = "/v1/runtime/identity"
 PRODUCER_MODE = "freetoken.experimental.file_backed_ftw_cpu_server"
 HASH_CHUNK = 8 * 1024 * 1024
+
+
+def _load_mapped_ftw_core():
+    """Load the torch-free storage core without executing checkpoint/__init__.py.
+
+    Importing ``freetoken.checkpoint.mapped_ftw_core`` normally executes the checkpoint package
+    initializer first, which imports torch.  Runtime identity must remain usable before any model
+    runtime dependency is imported, so load the already-existing torch-free source file directly.
+    """
+    path = Path(__file__).resolve().parents[1] / "checkpoint" / "mapped_ftw_core.py"
+    name = "_freetoken_file_backed_identity_mapped_ftw_core"
+    cached = sys.modules.get(name)
+    if cached is not None:
+        return cached
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load mapped FTW storage core: {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
+_STORAGE_CORE = _load_mapped_ftw_core()
+INDEX_NAME = _STORAGE_CORE.INDEX_NAME
+_as_int = _STORAGE_CORE._as_int
+_safe_shard_path = _STORAGE_CORE._safe_shard_path
+load_ftw_index = _STORAGE_CORE.load_ftw_index
 
 
 def _sha256_file(path: Path, digest: Any) -> int:
