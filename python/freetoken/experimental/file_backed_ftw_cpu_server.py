@@ -1,8 +1,9 @@
 """Opt-in server launcher for file-backed FTW expert sources on the CPU MoE backend.
 
 Normal ``ft serve`` is untouched.  This module patches only the spawned scheduler worker,
-forces the existing split-residency planning path, and replaces the engine's expert-bank
-loader with the explicit file-backed FTW provider.  It is intentionally fail-closed: an
+forces the existing split-residency planning path, replaces the engine's expert-bank loader
+with the explicit file-backed FTW provider, and exposes one read-only owner-native runtime
+identity route for this experimental server only.  It is intentionally fail-closed: an
 unsupported checkpoint/backend never falls back to the anonymous HostBank loader.
 
 This launcher does not weaken resource admission.  A real model must still pass a separate,
@@ -23,6 +24,38 @@ def _option_value(argv: Sequence[str], name: str) -> str | None:
         if arg.startswith(prefix):
             return arg[len(prefix):]
     return None
+
+
+def _required_model_path(argv: Sequence[str], *, prog: str) -> str:
+    """Return the one exact model path declared through either supported alias.
+
+    Repeated aliases are accepted only when they resolve to the same literal value.  This keeps
+    the identity producer from hashing one directory while the canonical parser later serves
+    another one.
+    """
+    values: list[str] = []
+    names = ("--model", "--model-path")
+    for index, arg in enumerate(argv):
+        for name in names:
+            if arg == name:
+                if index + 1 >= len(argv) or not argv[index + 1]:
+                    raise SystemExit(f"{prog}: error: {name} requires a value")
+                values.append(argv[index + 1])
+            else:
+                prefix = name + "="
+                if arg.startswith(prefix):
+                    value = arg[len(prefix):]
+                    if not value:
+                        raise SystemExit(f"{prog}: error: {name} requires a value")
+                    values.append(value)
+    if not values:
+        raise SystemExit(f"{prog}: error: explicit --model/--model-path is required")
+    unique = set(values)
+    if len(unique) != 1:
+        raise SystemExit(
+            f"{prog}: error: model path aliases disagree; runtime identity would be ambiguous"
+        )
+    return values[0]
 
 
 def _require_explicit_cpu_backend(argv: Sequence[str], *, prog: str) -> None:
@@ -98,9 +131,26 @@ def launch_server(
     effective_argv = list(sys.argv[1:] if argv is None else argv)
     display_prog = prog or "python -m freetoken.experimental.file_backed_ftw_cpu_server"
     _require_explicit_cpu_backend(effective_argv, prog=display_prog)
+    model_path = _required_model_path(effective_argv, prog=display_prog)
 
+    # Seal the exact local artifact before any server/backend is started. The identity is derived
+    # from checkpoint bytes, never accepted as a CLI claim, and cached for the process lifetime.
+    from freetoken.experimental.file_backed_ftw_runtime_identity import (
+        compute_ftw_artifact_identity,
+        register_runtime_identity_route,
+        unregister_runtime_identity_route,
+    )
+
+    artifact_identity = compute_ftw_artifact_identity(model_path)
+
+    from freetoken.server import api_server as server_api
     from freetoken.server import launch as server_launch
 
+    route = register_runtime_identity_route(
+        server_api.app,
+        server_api.get_global_state,
+        artifact_identity,
+    )
     original = server_launch._run_scheduler
     server_launch._run_scheduler = _run_scheduler_file_backed
     try:
@@ -110,8 +160,9 @@ def launch_server(
             prog=display_prog,
         )
     finally:
-        # Keep embedding/tests deterministic if argument parsing or startup exits early.
+        # Keep embedding/tests deterministic if argument parsing, startup, or shutdown returns.
         server_launch._run_scheduler = original
+        unregister_runtime_identity_route(server_api.app, route)
 
 
 def main() -> None:
@@ -125,6 +176,7 @@ if __name__ == "__main__":
 __all__ = [
     "_make_file_backed_loader",
     "_option_value",
+    "_required_model_path",
     "_require_explicit_cpu_backend",
     "launch_server",
 ]
