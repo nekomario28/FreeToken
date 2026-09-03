@@ -57,6 +57,44 @@ jobs:
             -p 'test_file_backed_ftw_runtime_identity.py' \
             -v
 
+      - name: Confirm live producer seals fixed owner source root
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import ast
+          from pathlib import Path
+
+          source_path = Path("python/freetoken/experimental/file_backed_ftw_runtime_identity.py")
+          tree = ast.parse(source_path.read_text(encoding="utf-8"), filename=str(source_path))
+          functions = {
+              node.name: node
+              for node in tree.body
+              if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+          }
+          register = functions["register_runtime_identity_route"]
+          calls = [
+              node
+              for node in ast.walk(register)
+              if isinstance(node, ast.Call)
+              and isinstance(node.func, ast.Name)
+              and node.func.id == "compute_bounded_software_identity"
+          ]
+          assert len(calls) == 1, calls
+          assert not calls[0].args and not calls[0].keywords, ast.dump(calls[0])
+
+          server_text = Path("python/freetoken/experimental/file_backed_ftw_cpu_server.py").read_text(encoding="utf-8")
+          for forbidden in (
+              "--source-root",
+              "--source-digest",
+              "--source-sha",
+              "FREETOKEN_SOURCE_ROOT",
+              "FREETOKEN_SOURCE_DIGEST",
+          ):
+              assert forbidden not in server_text, forbidden
+          print("FIXED_OWNER_SOURCE_PRODUCER_PASS")
+          PY
+
       - name: Emit exact bounded source identity receipt
         shell: bash
         env:
