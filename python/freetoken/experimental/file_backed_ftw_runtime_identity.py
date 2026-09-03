@@ -1,9 +1,10 @@
 """Owner-native immutable identity for the opt-in file-backed FTW server.
 
-This module is deliberately standard-library-only.  It hashes the exact local FTW directory
-selected by the experimental server, derives one immutable model identity, and exposes a
-read-only runtime document bound to the current frontend process generation.  It never loads
-weights, runs inference, starts a service, performs network I/O, or grants execution authority.
+This module is deliberately standard-library-only. It hashes the exact local FTW directory
+selected by the experimental server, seals a bounded identity of the source bytes that produce
+this experimental identity surface, and exposes a read-only runtime document bound to the
+current frontend process generation. It never loads weights, runs inference, starts a service,
+performs network I/O, or grants execution authority.
 """
 from __future__ import annotations
 
@@ -14,17 +15,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
-SCHEMA_VERSION = "freetoken-file-backed-ftw-runtime-identity/0.1"
+SCHEMA_VERSION = "freetoken-file-backed-ftw-runtime-identity/0.2"
 IDENTITY_ROUTE = "/v1/runtime/identity"
 PRODUCER_MODE = "freetoken.experimental.file_backed_ftw_cpu_server"
 HASH_CHUNK = 8 * 1024 * 1024
+SOURCE_IDENTITY_SCHEMA = "freetoken-bounded-owner-source-set/0.1"
+SOURCE_IDENTITY_SCOPE = "runtime_identity_producer_launcher_and_storage_core"
+SOURCE_IDENTITY_PATHS = (
+    "python/freetoken/experimental/file_backed_ftw_runtime_identity.py",
+    "python/freetoken/experimental/file_backed_ftw_cpu_server.py",
+    "python/freetoken/checkpoint/mapped_ftw_core.py",
+)
 
 
 def _load_mapped_ftw_core():
     """Load the torch-free storage core without executing checkpoint/__init__.py.
 
     Importing ``freetoken.checkpoint.mapped_ftw_core`` normally executes the checkpoint package
-    initializer first, which imports torch.  Runtime identity must remain usable before any model
+    initializer first, which imports torch. Runtime identity must remain usable before any model
     runtime dependency is imported, so load the already-existing torch-free source file directly.
     """
     path = Path(__file__).resolve().parents[1] / "checkpoint" / "mapped_ftw_core.py"
@@ -64,11 +72,140 @@ def _sha256_file(path: Path, digest: Any) -> int:
     return total
 
 
+def _lower_hex(value: Any, *, length: int, field: str) -> str:
+    if not isinstance(value, str) or len(value) != length:
+        raise ValueError(f"{field} must be a {length}-character digest")
+    try:
+        int(value, 16)
+    except ValueError as exc:
+        raise ValueError(f"{field} must be lowercase hexadecimal") from exc
+    if value.lower() != value:
+        raise ValueError(f"{field} must be lowercase hexadecimal")
+    return value
+
+
+def _source_set_digest(rows: list[dict[str, Any]]) -> str:
+    """Digest one exact ordered source-set identity without serialisation ambiguity."""
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(row["path"].encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(row["bytes_hashed"]).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(row["sha256"].encode("ascii"))
+        digest.update(b"\0")
+        digest.update(row["git_blob_sha1"].encode("ascii"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def compute_bounded_software_identity(
+    repo_root: str | Path | None = None,
+) -> dict[str, Any]:
+    """Hash the exact bounded owner source bytes used by this evidence producer.
+
+    This is a content-derived source-set revision, not a claim about the complete repository,
+    dependency environment, wheel/container image, or serving engine. The Git-blob SHA-1 is an
+    interoperability locator; SHA-256 remains the primary content identity.
+    """
+    root = (
+        Path(repo_root).resolve(strict=True)
+        if repo_root is not None
+        else Path(__file__).resolve().parents[3]
+    )
+    if not root.is_dir():
+        raise ValueError("bounded source identity requires a repository directory")
+
+    rows: list[dict[str, Any]] = []
+    for relative in SOURCE_IDENTITY_PATHS:
+        path = (root / relative).resolve(strict=True)
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise ValueError("bounded source path escapes repository root") from exc
+        if not path.is_file():
+            raise ValueError(f"bounded source path is not a file: {relative}")
+        raw = path.read_bytes()
+        if not raw:
+            raise ValueError(f"bounded source file is empty: {relative}")
+        git_header = b"blob " + str(len(raw)).encode("ascii") + b"\0"
+        rows.append(
+            {
+                "path": relative,
+                "bytes_hashed": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+                "git_blob_sha1": hashlib.sha1(
+                    git_header + raw,
+                    usedforsecurity=False,
+                ).hexdigest(),
+            }
+        )
+
+    return {
+        "schema_version": SOURCE_IDENTITY_SCHEMA,
+        "scope": SOURCE_IDENTITY_SCOPE,
+        "files": rows,
+        "source_set_sha256": _source_set_digest(rows),
+    }
+
+
+def _validated_software_identity(value: dict[str, Any]) -> dict[str, Any]:
+    expected = {"schema_version", "scope", "files", "source_set_sha256"}
+    if not isinstance(value, dict) or set(value) != expected:
+        raise ValueError("bounded software identity has an unexpected shape")
+    if value["schema_version"] != SOURCE_IDENTITY_SCHEMA:
+        raise ValueError("bounded software identity schema mismatch")
+    if value["scope"] != SOURCE_IDENTITY_SCOPE:
+        raise ValueError("bounded software identity scope mismatch")
+    files = value["files"]
+    if not isinstance(files, list) or len(files) != len(SOURCE_IDENTITY_PATHS):
+        raise ValueError("bounded software identity file set mismatch")
+
+    rows: list[dict[str, Any]] = []
+    for expected_path, row in zip(SOURCE_IDENTITY_PATHS, files, strict=True):
+        fields = {"path", "bytes_hashed", "sha256", "git_blob_sha1"}
+        if not isinstance(row, dict) or set(row) != fields:
+            raise ValueError("bounded software identity row has an unexpected shape")
+        if row["path"] != expected_path:
+            raise ValueError("bounded software identity path/order mismatch")
+        count = row["bytes_hashed"]
+        if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+            raise ValueError("bounded software identity bytes_hashed must be positive")
+        sha256 = _lower_hex(row["sha256"], length=64, field="source sha256")
+        git_blob_sha1 = _lower_hex(
+            row["git_blob_sha1"],
+            length=40,
+            field="source git_blob_sha1",
+        )
+        rows.append(
+            {
+                "path": expected_path,
+                "bytes_hashed": count,
+                "sha256": sha256,
+                "git_blob_sha1": git_blob_sha1,
+            }
+        )
+
+    source_set_sha256 = _lower_hex(
+        value["source_set_sha256"],
+        length=64,
+        field="source_set_sha256",
+    )
+    if source_set_sha256 != _source_set_digest(rows):
+        raise ValueError("bounded software identity aggregate digest mismatch")
+    return {
+        "schema_version": SOURCE_IDENTITY_SCHEMA,
+        "scope": SOURCE_IDENTITY_SCOPE,
+        "files": rows,
+        "source_set_sha256": source_set_sha256,
+    }
+
+
 def compute_ftw_artifact_identity(model_path: str | Path) -> dict[str, Any]:
     """Hash one validated local FTW checkpoint without loading model tensors.
 
     The logical payload digest is the concatenation of declared shard bytes ordered by
-    ``global_off``.  This intentionally matches the project-side FTW load-admission identity
+    ``global_off``. This intentionally matches the project-side FTW load-admission identity
     algorithm so the two independent owners can be compared exactly later.
     """
     root = Path(model_path).resolve(strict=True)
@@ -130,19 +267,8 @@ def _validated_artifact_identity(value: dict[str, Any]) -> dict[str, Any]:
     }
     if not isinstance(value, dict) or set(value) != expected:
         raise ValueError("runtime artifact identity has an unexpected shape")
-    payload = value["payload_sha256"]
-    index = value["index_sha256"]
-    if not isinstance(payload, str) or len(payload) != 64:
-        raise ValueError("payload_sha256 must be a 64-character digest")
-    if not isinstance(index, str) or len(index) != 64:
-        raise ValueError("index_sha256 must be a 64-character digest")
-    try:
-        int(payload, 16)
-        int(index, 16)
-    except ValueError as exc:
-        raise ValueError("artifact digests must be lowercase hexadecimal") from exc
-    if payload.lower() != payload or index.lower() != index:
-        raise ValueError("artifact digests must be lowercase hexadecimal")
+    payload = _lower_hex(value["payload_sha256"], length=64, field="payload_sha256")
+    index = _lower_hex(value["index_sha256"], length=64, field="index_sha256")
     for field in ("payload_bytes_hashed", "shards_hashed"):
         item = value[field]
         if isinstance(item, bool) or not isinstance(item, int) or item <= 0:
@@ -156,11 +282,13 @@ def _validated_artifact_identity(value: dict[str, Any]) -> dict[str, Any]:
 def build_runtime_identity_document(
     state: Any,
     artifact_identity: dict[str, Any],
+    software_identity: dict[str, Any],
     *,
     observed_at: str | None = None,
 ) -> dict[str, Any]:
-    """Bind the sealed artifact identity to the current frontend server generation."""
+    """Bind sealed artifact + bounded source identities to one frontend generation."""
     artifact = _validated_artifact_identity(artifact_identity)
+    software = _validated_software_identity(software_identity)
     maintenance = str(getattr(state, "maintenance_state", "unknown"))
     config = getattr(state, "config", None)
     model_id = getattr(config, "served_model_name", None)
@@ -188,6 +316,7 @@ def build_runtime_identity_document(
             "payload_bytes_hashed": artifact["payload_bytes_hashed"],
             "shards_hashed": artifact["shards_hashed"],
         },
+        "software": software,
         "producer": {
             "mode": PRODUCER_MODE,
             "scope": "current_frontend_process_generation",
@@ -206,6 +335,7 @@ def build_runtime_identity_document(
             "identity observation is not candidate-evaluation authority",
             "identity observation is not semantic or task-quality truth",
             "identity observation is not promotion authority",
+            "bounded source identity is not complete repository or runtime provenance",
         ],
     }
 
@@ -215,15 +345,22 @@ def register_runtime_identity_route(
     get_state: Callable[[], Any],
     artifact_identity: dict[str, Any],
 ) -> Any:
-    """Register the experimental route and return its exact route object for later removal."""
+    """Seal owner identities, register one GET route, and return the exact route object."""
     artifact = _validated_artifact_identity(artifact_identity)
-    existing = [route for route in getattr(app, "routes", ()) if getattr(route, "path", None) == IDENTITY_ROUTE]
+    # Seal source bytes once before the server/backend starts. The endpoint never accepts a
+    # caller-provided software revision and never reinterprets a CLI/environment revision claim.
+    software = compute_bounded_software_identity()
+    existing = [
+        route
+        for route in getattr(app, "routes", ())
+        if getattr(route, "path", None) == IDENTITY_ROUTE
+    ]
     if existing:
         raise RuntimeError(f"runtime identity route already registered: {IDENTITY_ROUTE}")
     before = {id(route) for route in getattr(app, "routes", ())}
 
     async def runtime_identity():
-        return build_runtime_identity_document(get_state(), artifact)
+        return build_runtime_identity_document(get_state(), artifact, software)
 
     app.add_api_route(
         IDENTITY_ROUTE,
@@ -256,7 +393,11 @@ __all__ = [
     "IDENTITY_ROUTE",
     "PRODUCER_MODE",
     "SCHEMA_VERSION",
+    "SOURCE_IDENTITY_PATHS",
+    "SOURCE_IDENTITY_SCHEMA",
+    "SOURCE_IDENTITY_SCOPE",
     "build_runtime_identity_document",
+    "compute_bounded_software_identity",
     "compute_ftw_artifact_identity",
     "register_runtime_identity_route",
     "unregister_runtime_identity_route",

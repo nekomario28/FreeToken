@@ -1,0 +1,82 @@
+name: File-backed FTW bounded source identity v0.10
+
+on:
+  push:
+    branches:
+      - research/file-backed-ftw-bounded-source-identity-v10-20260904
+    paths:
+      - "python/freetoken/experimental/file_backed_ftw_cpu_server.py"
+      - "python/freetoken/experimental/file_backed_ftw_runtime_identity.py"
+      - "python/freetoken/checkpoint/mapped_ftw_core.py"
+      - "tests/experimental/test_file_backed_ftw_runtime_identity.py"
+      - ".github/workflows/file-backed-ftw-bounded-source-identity-v10.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout exact head
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+          clean: true
+          fetch-depth: 0
+
+      - name: Confirm exact clean head
+        shell: bash
+        env:
+          EXPECTED_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_SHA"
+          test -z "$(git status --porcelain=v1)"
+
+      - name: Compile bounded source identity surface
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile \
+            python/freetoken/experimental/file_backed_ftw_cpu_server.py \
+            python/freetoken/experimental/file_backed_ftw_runtime_identity.py \
+            tests/experimental/test_file_backed_ftw_runtime_identity.py
+
+      - name: Run deterministic bounded source identity tests
+        shell: bash
+        env:
+          PYTHONPATH: python
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover \
+            -s tests/experimental \
+            -p 'test_file_backed_ftw_runtime_identity.py' \
+            -v
+
+      - name: Emit exact bounded source identity receipt
+        shell: bash
+        env:
+          PYTHONPATH: python
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from freetoken.experimental.file_backed_ftw_runtime_identity import (
+              SCHEMA_VERSION,
+              compute_bounded_software_identity,
+          )
+          identity = compute_bounded_software_identity()
+          print("OWNER_RUNTIME_IDENTITY_SCHEMA=" + SCHEMA_VERSION)
+          print("BOUNDED_SOURCE_IDENTITY_JSON=" + json.dumps(identity, sort_keys=True, separators=(",", ":")))
+          PY
+
+      - name: Confirm worktree remains clean
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain=v1)"
+          echo "FILE_BACKED_FTW_BOUNDED_SOURCE_IDENTITY_V10_PASS sha=$(git rev-parse HEAD)"
