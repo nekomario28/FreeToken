@@ -11,6 +11,13 @@ Projection fusion is header-driven. Parts with one packed quant type are concate
 as packed output rows and use one ``GGUFLinear``. Mixed packed/dense parts use a small
 correctness-first composite op, so the adapter never assumes PeasantSmith's exact
 per-tensor quant recipe beyond the routed-expert contract.
+
+One semantic conversion is mandatory: llama.cpp stores Qwen3.5/3.8 GDN value heads in
+its tiled broadcast order, while FreeToken follows the HF grouped-by-key-head order.
+Row-oriented tensors are inverse-permuted at load without dequantizing packed rows.
+The output projection keeps its GGUF column layout and instead permutes its activation
+from grouped -> tiled immediately before the native GGUF GEMM; this avoids any
+requantization or block-layout surgery.
 """
 from __future__ import annotations
 
@@ -70,6 +77,63 @@ class _TensorSpec:
     ggml_type: int
 
 
+def _v_grouped_to_tiled_perm(
+    num_k_heads: int, num_v_heads: int, head_dim: int
+) -> torch.Tensor:
+    """Output-position -> grouped-input-position permutation used by llama.cpp.
+
+    HF grouped order is ``[K0:v0..vr, K1:v0..vr, ...]``. llama.cpp transposes the
+    logical ``[K, r, D]`` head grid to ``[r, K, D]`` before flattening.
+    """
+    if num_v_heads % num_k_heads:
+        raise ValueError(f"num_v_heads {num_v_heads} not divisible by num_k_heads {num_k_heads}")
+    r = num_v_heads // num_k_heads
+    return (
+        torch.arange(num_v_heads * head_dim, dtype=torch.long)
+        .reshape(num_k_heads, r, head_dim)
+        .permute(1, 0, 2)
+        .reshape(-1)
+    )
+
+
+def _v_tiled_to_grouped_perm(
+    num_k_heads: int, num_v_heads: int, head_dim: int
+) -> torch.Tensor:
+    return torch.argsort(_v_grouped_to_tiled_perm(num_k_heads, num_v_heads, head_dim))
+
+
+def _grouped_to_tiled_last(
+    x: torch.Tensor, num_k_heads: int, num_v_heads: int, head_dim: int
+) -> torch.Tensor:
+    """Runtime activation permutation matching llama.cpp's output-projection columns."""
+    if x.shape[-1] != num_v_heads * head_dim:
+        raise ValueError(
+            f"GDN output width {x.shape[-1]} != {num_v_heads}*{head_dim}"
+        )
+    r = num_v_heads // num_k_heads
+    shape = x.shape
+    return (
+        x.reshape(*shape[:-1], num_k_heads, r, head_dim)
+        .transpose(-3, -2)
+        .reshape(*shape)
+        .contiguous()
+    )
+
+
+def _gdn_inverse_row_indices(
+    group: LinearGatedDeltaGroupConfig,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Indices restoring llama.cpp's tiled GDN rows to HF/FreeToken grouped order."""
+    inv_v = _v_tiled_to_grouped_perm(
+        group.num_key_heads, group.num_value_heads, group.value_head_dim
+    )
+    inv_h = _v_tiled_to_grouped_perm(group.num_key_heads, group.num_value_heads, 1)
+    key_dim = group.num_key_heads * group.key_head_dim
+    qk = torch.arange(2 * key_dim, dtype=torch.long)
+    qkv = torch.cat((qk, 2 * key_dim + inv_v))
+    return qkv, inv_v, inv_h
+
+
 class _GGUFMixedLinear(BaseOP):
     """Fused logical Linear backed by independently-typed GGUF projection parts.
 
@@ -109,6 +173,51 @@ class _GGUFMixedLinear(BaseOP):
         if self._pad:
             outs.append(x.new_zeros((x.shape[0], self._pad)))
         return torch.cat(outs, dim=-1)
+
+
+class _GGUFVOutputLinear(BaseOP):
+    """GDN output projection with llama.cpp tiled GGUF columns.
+
+    FreeToken's GDN produces HF grouped value-head order. The stored GGUF projection
+    had its columns permuted grouped->tiled by llama.cpp, so apply the same permutation
+    to the activation and leave the packed weight byte-for-byte unchanged.
+    """
+
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        quant_type: int,
+        *,
+        num_k_heads: int,
+        num_v_heads: int,
+        head_dim: int,
+    ) -> None:
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
+        self._quant_type = int(quant_type)
+        self._num_k_heads = int(num_k_heads)
+        self._num_v_heads = int(num_v_heads)
+        self._head_dim = int(head_dim)
+        if self._quant_type in _PACKED_DENSE:
+            self.qweight = torch.empty(
+                self.out_features,
+                row_bytes(self.in_features, self._quant_type),
+                dtype=torch.uint8,
+            )
+        elif self._quant_type in _UNQUANTIZED:
+            self.weight = torch.empty(self.out_features, self.in_features)
+        else:
+            raise NotImplementedError(f"Qwen4Exp GDN output GGUF type {quant_type} unsupported")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = _grouped_to_tiled_last(
+            x, self._num_k_heads, self._num_v_heads, self._head_dim
+        )
+        if self._quant_type in _PACKED_DENSE:
+            return fused_mul_mat_gguf(x, self.qweight, self._quant_type)
+        w = self.weight if self.weight.dtype == x.dtype else self.weight.to(x.dtype)
+        return F.linear(x, w)
 
 
 class _GGUFUntiedLMHead(BaseOP):
@@ -220,6 +329,27 @@ def _swap_projection(owner, attr: str, parts: Sequence[_TensorSpec], *, pad: int
     setattr(owner, attr, _GGUFMixedLinear(in_features, parts, pad=pad))
 
 
+def _swap_gdn_output(
+    owner,
+    part: _TensorSpec,
+    group: LinearGatedDeltaGroupConfig,
+) -> None:
+    old = owner.out_proj
+    if part.shape != (int(old.out_features), int(old.in_features)):
+        raise ValueError(
+            f"{part.name}: shape {part.shape} != GDN out_proj "
+            f"{(int(old.out_features), int(old.in_features))}"
+        )
+    owner.out_proj = _GGUFVOutputLinear(
+        int(old.in_features),
+        int(old.out_features),
+        part.ggml_type,
+        num_k_heads=group.num_key_heads,
+        num_v_heads=group.num_value_heads,
+        head_dim=group.value_head_dim,
+    )
+
+
 def _dense_payload(t, *, out_dtype: torch.dtype = torch.bfloat16, zero_centered: bool = False):
     if int(t.ggml_type) not in _UNQUANTIZED:
         raise ValueError(f"{t.name}: expected unquantized GGUF tensor, got type {t.ggml_type}")
@@ -229,24 +359,56 @@ def _dense_payload(t, *, out_dtype: torch.dtype = torch.bfloat16, zero_centered:
     return value
 
 
-def _emit_projection(target: str, parts, *, pad: int = 0) -> Iterator[tuple[str, torch.Tensor]]:
+def _row_payload(t, spec: _TensorSpec, rows: torch.Tensor | None):
+    if spec.ggml_type in _PACKED_DENSE:
+        value = t.packed()
+    else:
+        value = _dense_payload(t)
+    if rows is not None:
+        value = value.index_select(0, rows.to(value.device))
+    return value
+
+
+def _emit_projection(
+    target: str,
+    parts,
+    *,
+    pad: int = 0,
+    row_indices: Sequence[torch.Tensor | None] | None = None,
+) -> Iterator[tuple[str, torch.Tensor]]:
     specs = tuple(_TensorSpec(t.name, t.shape, int(t.ggml_type)) for t in parts)
     _validate_projection(specs, expected_in=int(specs[0].shape[1]))
+    rows = tuple(row_indices or (None,) * len(parts))
+    if len(rows) != len(parts):
+        raise ValueError("row_indices length must match projection parts")
     mode = _projection_mode(specs, pad=pad)
+    payloads = tuple(_row_payload(t, spec, row) for t, spec, row in zip(parts, specs, rows))
     if mode == "dense":
-        rows = [_dense_payload(t) for t in parts]
+        dense_rows = list(payloads)
         if pad:
-            rows.append(torch.zeros(pad, specs[0].shape[1], dtype=rows[0].dtype))
-        yield f"{target}.weight", torch.cat(rows, dim=0)
+            dense_rows.append(
+                torch.zeros(pad, specs[0].shape[1], dtype=dense_rows[0].dtype)
+            )
+        yield f"{target}.weight", torch.cat(dense_rows, dim=0)
         return
     if mode == "packed":
-        yield f"{target}.qweight", torch.cat([t.packed() for t in parts], dim=0)
+        yield f"{target}.qweight", torch.cat(payloads, dim=0)
         return
-    for i, (t, spec) in enumerate(zip(parts, specs)):
+    for i, (payload, spec) in enumerate(zip(payloads, specs)):
         if spec.ggml_type in _PACKED_DENSE:
-            yield f"{target}.qweight_{i}", t.packed()
+            yield f"{target}.qweight_{i}", payload
         else:
-            yield f"{target}.weight_{i}", _dense_payload(t)
+            yield f"{target}.weight_{i}", payload
+
+
+def _emit_gdn_output(target: str, tensor) -> Iterator[tuple[str, torch.Tensor]]:
+    spec = _TensorSpec(tensor.name, tensor.shape, int(tensor.ggml_type))
+    if spec.ggml_type in _PACKED_DENSE:
+        yield f"{target}.qweight", tensor.packed()
+    elif spec.ggml_type in _UNQUANTIZED:
+        yield f"{target}.weight", _dense_payload(tensor)
+    else:
+        raise NotImplementedError(f"{tensor.name}: unsupported GDN output type {spec.ggml_type}")
 
 
 def parse_gguf_config(shim: "GgufConfigShim") -> ModelConfig:
@@ -420,6 +582,8 @@ def convert_qwen4exp_to_gguf(model, config: ModelConfig) -> None:
     _swap_projection(top, "input_mix_weight_up", specs("output_hc_up.weight"))
 
     hc_pad = (-(config.qwen4_args.hc_lowrank + config.qwen4_args.hc_count)) % 16
+    linear_group = config.linear_attention_group()
+    assert linear_group is not None
     for lid, layer in enumerate(model.model.layers.op_list):
         for stem, owner in (
             ("hc_attn", layer.attn_hyper_connection),
@@ -445,7 +609,7 @@ def convert_qwen4exp_to_gguf(model, config: ModelConfig) -> None:
                     f"blk.{lid}.ssm_alpha.weight",
                 ),
             )
-            _swap_projection(la, "out_proj", specs(f"blk.{lid}.ssm_out.weight"))
+            _swap_gdn_output(la, specs(f"blk.{lid}.ssm_out.weight")[0], linear_group)
         else:
             attn = layer.self_attn
             _swap_projection(
@@ -527,26 +691,51 @@ def iter_gguf_weights(
         used.add(name)
         return t
 
-    def emit(target: str, *names: str, pad: int = 0):
+    def emit(
+        target: str,
+        *names: str,
+        pad: int = 0,
+        row_indices: Sequence[torch.Tensor | None] | None = None,
+    ):
         parts = tuple(take(name) for name in names)
-        yield from _emit_projection(target, parts, pad=pad)
+        yield from _emit_projection(
+            target, parts, pad=pad, row_indices=row_indices
+        )
 
-    def dense(target: str, name: str, *, zero_centered: bool = False, dtype=torch.bfloat16, reshape=None):
+    def dense(
+        target: str,
+        name: str,
+        *,
+        zero_centered: bool = False,
+        dtype=torch.bfloat16,
+        reshape=None,
+        rows: torch.Tensor | None = None,
+    ):
         t = take(name)
         value = _dense_payload(t, out_dtype=dtype, zero_centered=zero_centered)
+        if rows is not None:
+            value = value.index_select(0, rows.to(value.device))
         if reshape is not None:
             value = value.reshape(*reshape)
         yield target, value
 
     # Embedding / final HC / output head.
     yield from emit("model.embed_tokens", "token_embd.weight")
-    yield from dense("model.hyper_connection_mixer.hc_norm.weight", "output_hc_norm.weight", zero_centered=True, reshape=(-1,))
+    yield from dense(
+        "model.hyper_connection_mixer.hc_norm.weight",
+        "output_hc_norm.weight",
+        zero_centered=True,
+        reshape=(-1,),
+    )
     yield from emit("model.hyper_connection_mixer.input_mix_weight_down", "output_hc_down.weight")
     yield from emit("model.hyper_connection_mixer.input_mix_weight_up", "output_hc_up.weight")
     if "output.weight" in by:
         yield from emit("lm_head", "output.weight")
 
     hc_pad = (-(config.qwen4_args.hc_lowrank + config.qwen4_args.hc_count)) % 16
+    linear_group = config.linear_attention_group()
+    assert linear_group is not None
+    qkv_rows, v_rows, head_rows = _gdn_inverse_row_indices(linear_group)
     for lid in range(config.num_layers):
         base = f"model.layers.{lid}"
         for stem, target in (
@@ -577,17 +766,35 @@ def iter_gguf_weights(
                 f"blk.{lid}.attn_gate.weight",
                 f"blk.{lid}.ssm_beta.weight",
                 f"blk.{lid}.ssm_alpha.weight",
+                row_indices=(qkv_rows, v_rows, head_rows, head_rows),
             )
-            conv_dim = config.linear_attention_group().num_key_heads * config.linear_attention_group().key_head_dim * 2 + config.linear_attention_group().num_value_heads * config.linear_attention_group().value_head_dim
+            conv_dim = (
+                linear_group.num_key_heads * linear_group.key_head_dim * 2
+                + linear_group.num_value_heads * linear_group.value_head_dim
+            )
             yield from dense(
                 f"{p}.conv1d.weight",
                 f"blk.{lid}.ssm_conv1d.weight",
-                reshape=(conv_dim, 1, config.linear_attention_group().conv_kernel_dim),
+                rows=qkv_rows,
+                reshape=(conv_dim, 1, linear_group.conv_kernel_dim),
             )
-            yield from dense(f"{p}.dt_bias", f"blk.{lid}.ssm_dt.bias", dtype=torch.float32, reshape=(-1,))
-            yield from dense(f"{p}.A_log", f"blk.{lid}.ssm_a", dtype=torch.float32, reshape=(-1,))
+            yield from dense(
+                f"{p}.dt_bias",
+                f"blk.{lid}.ssm_dt.bias",
+                dtype=torch.float32,
+                rows=head_rows,
+                reshape=(-1,),
+            )
+            yield from dense(
+                f"{p}.A_log",
+                f"blk.{lid}.ssm_a",
+                dtype=torch.float32,
+                rows=head_rows,
+                reshape=(-1,),
+            )
             yield from dense(f"{p}.norm.weight", f"blk.{lid}.ssm_norm.weight", reshape=(-1,))
-            yield from emit(f"{p}.out_proj", f"blk.{lid}.ssm_out.weight")
+            out = take(f"blk.{lid}.ssm_out.weight")
+            yield from _emit_gdn_output(f"{p}.out_proj", out)
         else:
             p = f"{base}.self_attn"
             yield from emit(
@@ -597,8 +804,18 @@ def iter_gguf_weights(
                 f"blk.{lid}.attn_v.weight",
             )
             yield from emit(f"{p}.o_proj", f"blk.{lid}.attn_output.weight")
-            yield from dense(f"{p}.q_norm.weight", f"blk.{lid}.attn_q_norm.weight", zero_centered=True, reshape=(-1,))
-            yield from dense(f"{p}.k_norm.weight", f"blk.{lid}.attn_k_norm.weight", zero_centered=True, reshape=(-1,))
+            yield from dense(
+                f"{p}.q_norm.weight",
+                f"blk.{lid}.attn_q_norm.weight",
+                zero_centered=True,
+                reshape=(-1,),
+            )
+            yield from dense(
+                f"{p}.k_norm.weight",
+                f"blk.{lid}.attn_k_norm.weight",
+                zero_centered=True,
+                reshape=(-1,),
+            )
             yield from emit(
                 f"{p}.indexer.index_qk_proj",
                 f"blk.{lid}.indexer.q_proj.weight",
