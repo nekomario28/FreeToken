@@ -41,6 +41,7 @@ def _shim():
     }
     return SimpleNamespace(
         metadata=metadata,
+        model_path="/tmp/qwen38-test.gguf",
         vocab_size=248320,
         tie_word_embeddings=False,
         architectures=["Qwen4ExpGGUFForCausalLM"],
@@ -69,6 +70,7 @@ def test_qwen4exp_gguf_config_matches_published_geometry():
     assert cfg.qwen4_args.index_head_dim == 128
     assert cfg.qwen4_args.index_budget == 2048
     assert cfg.qwen4_args.index_ratio == 4
+    assert cfg.qwen4_args.gguf_model_path == "/tmp/qwen38-test.gguf"
 
     full = next(g for g in cfg.attention_groups if isinstance(g, FullAttentionGroupConfig))
     linear = cfg.linear_attention_group()
