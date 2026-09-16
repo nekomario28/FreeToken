@@ -11,6 +11,7 @@ Contracts shared across modules (do not rename):
 
 from .config import parse_config
 from .model import Qwen4ExpForCausalLM, Qwen4ExpForConditionalGeneration
+from .gguf import Qwen4ExpGGUFForCausalLM, iter_gguf_weights, parse_gguf_config
 from .weight import (
     ftw_side_files,
     nvfp4_expert_spec,
@@ -28,9 +29,12 @@ __all__ = [
     "nvfp4_expert_spec",
     "Qwen4ExpForCausalLM",
     "Qwen4ExpForConditionalGeneration",
+    "Qwen4ExpGGUFForCausalLM",
     "iter_vision_weights",
     "iter_weights",
+    "iter_gguf_weights",
     "load_ple_table",
     "parse_config",
+    "parse_gguf_config",
     "iter_expert_pieces",
 ]
