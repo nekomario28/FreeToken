@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+from freetoken.models.config import FullAttentionGroupConfig
 from freetoken.models.qwen4_exp.gguf import parse_gguf_config
 
 
@@ -69,9 +70,10 @@ def test_qwen4exp_gguf_config_matches_published_geometry():
     assert cfg.qwen4_args.index_budget == 2048
     assert cfg.qwen4_args.index_ratio == 4
 
-    full = cfg.full_attention_group()
+    full = next(g for g in cfg.attention_groups if isinstance(g, FullAttentionGroupConfig))
     linear = cfg.linear_attention_group()
     assert full.layer_ids == tuple(range(3, 48, 4))
+    assert linear is not None
     assert linear.num_key_heads == 16
     assert linear.num_value_heads == 48
     assert linear.key_head_dim == 128
