@@ -279,7 +279,7 @@ class ColdSourceBinding:
             else:
                 for name in cache.bank_schema:
                     staged = batch[name]
-                    cache.bank_caches[name].index_copy_(0, dst, staged)
+                    cache.bank_caches[name].index_copy_(0, dst.long(), staged)
                     source_bytes += staged.numel() * staged.element_size()
                     bank_rows += n
             microbatches += 1
@@ -294,8 +294,7 @@ class ColdSourceBinding:
 
 def bind_cold_source(
     cache,
-    *,
-    source: ColdExpertSource,
+    *,    source: ColdExpertSource,
     layouts: Mapping[str, ColdBankLayout],
     microbatch_size: int = 4,
 ) -> ColdSourceBinding:
