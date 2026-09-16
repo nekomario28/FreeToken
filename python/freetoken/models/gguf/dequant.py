@@ -23,6 +23,7 @@ GGML_F32 = 0
 GGML_F16 = 1
 GGML_Q4_0 = 2
 GGML_Q8_0 = 8
+GGML_Q4_K = 12
 GGML_Q6_K = 14
 GGML_BF16 = 30
 
@@ -33,6 +34,8 @@ BLOCK_SHAPE: dict[int, tuple[int, int]] = {
     GGML_BF16: (1, 2),
     GGML_Q4_0: (32, 18),
     GGML_Q8_0: (32, 34),
+    # Q4_K super-block: d + dmin (2 x fp16), 12 scale/min bytes, 128 q bytes.
+    GGML_Q4_K: (256, 144),
     GGML_Q6_K: (256, 210),
 }
 
@@ -42,6 +45,7 @@ GGML_NAME = {
     GGML_BF16: "BF16",
     GGML_Q4_0: "Q4_0",
     GGML_Q8_0: "Q8_0",
+    GGML_Q4_K: "Q4_K",
     GGML_Q6_K: "Q6_K",
 }
 
@@ -122,7 +126,12 @@ _DEQUANT = {
 
 
 def dequantize(raw: torch.Tensor, ggml_type: int, out_dtype: torch.dtype) -> torch.Tensor:
-    """Dequantize ``raw`` (uint8) of any supported ggml type to flat ``out_dtype``."""
+    """Dequantize ``raw`` (uint8) of any supported ggml type to flat ``out_dtype``.
+
+    Q4_K is intentionally metadata/device-kernel-only here for now: the production
+    GGUF kernels already dequantize it in-device, while this pure-Torch reference path
+    has no Q4_K oracle yet.
+    """
     if ggml_type == GGML_F32:
         return raw.view(torch.float32).to(out_dtype)
     if ggml_type == GGML_F16:
@@ -143,6 +152,7 @@ __all__ = [
     "GGML_BF16",
     "GGML_Q4_0",
     "GGML_Q8_0",
+    "GGML_Q4_K",
     "GGML_Q6_K",
     "GGML_NAME",
     "BLOCK_SHAPE",
